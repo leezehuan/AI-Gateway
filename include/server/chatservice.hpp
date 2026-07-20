@@ -5,76 +5,70 @@
 #include <unordered_map>
 #include <functional>
 #include <mutex>
-#include "json.hpp"
-#include "usermodel.hpp"
-#include "offlinemessagemodel.hpp"
-#include "friendmodel.hpp"
-#include "group_model.hpp"
-#include "redis.hpp"
-
-using json = nlohmann::json;
+using namespace std;
 using namespace muduo;
 using namespace muduo::net;
 
-// 回调函数类型
-using MsgHandler = std::function<void(const TcpConnectionPtr&, json&, Timestamp)>;
+#include "redis.hpp"
+#include "groupmodel.hpp"
+#include "friendmodel.hpp"
+#include "usermodel.hpp"
+#include "offlinemessagemodel.hpp"
+#include "json.hpp"
+using json = nlohmann::json;
+
+// 表示处理消息的事件回调方法类型
+using MsgHandler = std::function<void(const TcpConnectionPtr &conn, json &js, Timestamp)>;
 
 // 聊天服务器业务类
 class ChatService
 {
 public:
-    // ChatService 单例模式
-    // thread safe
-    static ChatService* instance() {
-        static ChatService service;
-        return &service;
-    }
-
-    // 登录业务
-    void loginHandler(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 注册业务
-    void registerHandler(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 获取单例对象的接口函数
+    static ChatService *instance();
+    // 处理登录业务
+    void login(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 处理注册业务
+    void reg(const TcpConnectionPtr &conn, json &js, Timestamp time);
     // 一对一聊天业务
-    void oneChatHandler(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    void oneChat(const TcpConnectionPtr &conn, json &js, Timestamp time);
     // 添加好友业务
-    void addFriendHandler(const TcpConnectionPtr &conn, json &js, Timestamp time);
-    // 获取对应消息的处理器
-    MsgHandler getHandler(int msgId);
+    void addFriend(const TcpConnectionPtr &conn, json &js, Timestamp time);
     // 创建群组业务
     void createGroup(const TcpConnectionPtr &conn, json &js, Timestamp time);
     // 加入群组业务
     void addGroup(const TcpConnectionPtr &conn, json &js, Timestamp time);
     // 群组聊天业务
     void groupChat(const TcpConnectionPtr &conn, json &js, Timestamp time);
+    // 处理注销业务
+    void loginout(const TcpConnectionPtr &conn, json &js, Timestamp time);
     // 处理客户端异常退出
-    void clientCloseExceptionHandler(const TcpConnectionPtr &conn);
-    // 服务端异常终止之后的操作
+    void clientCloseException(const TcpConnectionPtr &conn);
+    // 服务器异常，业务重置方法
     void reset();
-    //redis订阅消息触发的回调函数
-    void redis_subscribe_message_handler(int channel, string message);
+    // 获取消息对应的处理器
+    MsgHandler getHandler(int msgid);
+    // 从redis消息队列中获取订阅的消息
+    void handleRedisSubscribeMessage(int, string);
 
 private:
     ChatService();
-    ChatService(const ChatService&) = delete;
-    ChatService& operator=(const ChatService&) = delete;
 
     // 存储消息id和其对应的业务处理方法
-    std::unordered_map<int, MsgHandler> _msgHandlerMap;
-    
+    unordered_map<int, MsgHandler> _msgHandlerMap;
     // 存储在线用户的通信连接
-    std::unordered_map<int, TcpConnectionPtr> _userConnMap;
-
-    // 定义互斥锁
-    std::mutex _connMutex;
-
-    //redis操作对象
-    Redis _redis;
+    unordered_map<int, TcpConnectionPtr> _userConnMap;
+    // 定义互斥锁，保证_userConnMap的线程安全
+    mutex _connMutex;
 
     // 数据操作类对象
     UserModel _userModel;
     OfflineMsgModel _offlineMsgModel;
     FriendModel _friendModel;
     GroupModel _groupModel;
+
+    // redis操作对象
+    Redis _redis;
 };
 
-#endif // CHATSERVICE_H
+#endif
