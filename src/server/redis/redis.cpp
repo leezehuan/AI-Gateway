@@ -1,4 +1,5 @@
 #include "redis.hpp"
+#include "config.hpp"
 #include <iostream>
 using namespace std;
 
@@ -53,29 +54,48 @@ Redis::~Redis()
  */
 bool Redis::connect()
 {
+    const string host = chat_config::getEnv("CHAT_REDIS_HOST", "127.0.0.1");
+    const unsigned int port = chat_config::getPort("CHAT_REDIS_PORT", 6379);
+
     // 负责publish发布消息的上下文连接
-    _publish_context = redisConnect("127.0.0.1", 6379);
-    if (nullptr == _publish_context)
+    _publish_context = redisConnect(host.c_str(), port);
+    if (nullptr == _publish_context || _publish_context->err)
     {
-        cerr << "connect redis failed!" << endl;
+        cerr << "connect redis " << host << ":" << port << " failed: "
+             << (_publish_context == nullptr ? "cannot allocate context" : _publish_context->errstr)
+             << endl;
+        if (_publish_context != nullptr)
+        {
+            redisFree(_publish_context);
+            _publish_context = nullptr;
+        }
         return false;
     }
 
     // 负责subscribe订阅消息的上下文连接
-    _subcribe_context = redisConnect("127.0.0.1", 6379);
-    if (nullptr == _subcribe_context)
+    _subcribe_context = redisConnect(host.c_str(), port);
+    if (nullptr == _subcribe_context || _subcribe_context->err)
     {
-        cerr << "connect redis failed!" << endl;
+        cerr << "connect redis " << host << ":" << port << " failed: "
+             << (_subcribe_context == nullptr ? "cannot allocate context" : _subcribe_context->errstr)
+             << endl;
+        if (_subcribe_context != nullptr)
+        {
+            redisFree(_subcribe_context);
+            _subcribe_context = nullptr;
+        }
+        redisFree(_publish_context);
+        _publish_context = nullptr;
         return false;
     }
 
     // 在单独的线程中，监听通道上的事件，有消息给业务层进行上报
-    thread t([&]() {
+    thread t([this]() {
         observer_channel_message();
     });
     t.detach();
 
-    cout << "connect redis-server success!" << endl;
+    cout << "connect redis-server " << host << ":" << port << " success!" << endl;
 
     return true;
 }
@@ -95,6 +115,12 @@ bool Redis::connect()
  */
 bool Redis::publish(int channel, string message)
 {
+    if (_publish_context == nullptr)
+    {
+        cerr << "publish command failed: redis is not connected" << endl;
+        return false;
+    }
+
     redisReply *reply = (redisReply *)redisCommand(_publish_context, "PUBLISH %d %s", channel, message.c_str());
     if (nullptr == reply)
     {
@@ -122,6 +148,12 @@ bool Redis::publish(int channel, string message)
  */
 bool Redis::subscribe(int channel)
 {
+    if (_subcribe_context == nullptr)
+    {
+        cerr << "subscribe command failed: redis is not connected" << endl;
+        return false;
+    }
+
     // SUBSCRIBE命令本身会造成线程阻塞等待通道里面发生消息，这里只做订阅通道，不接收通道消息
     // 通道消息的接收专门在observer_channel_message函数中的独立线程中进行
     // 只负责发送命令，不阻塞接收redis server响应消息，否则和notifyMsg线程抢占响应资源
@@ -159,6 +191,12 @@ bool Redis::subscribe(int channel)
  */
 bool Redis::unsubscribe(int channel)
 {
+    if (_subcribe_context == nullptr)
+    {
+        cerr << "unsubscribe command failed: redis is not connected" << endl;
+        return false;
+    }
+
     if (REDIS_ERR == redisAppendCommand(this->_subcribe_context, "UNSUBSCRIBE %d", channel))
     {
         cerr << "unsubscribe command failed!" << endl;
@@ -195,7 +233,10 @@ void Redis::observer_channel_message()
     while (REDIS_OK == redisGetReply(this->_subcribe_context, (void **)&reply))
     {
         // 订阅收到的消息是一个带三元素的数组
-        if (reply != nullptr && reply->element[2] != nullptr && reply->element[2]->str != nullptr)
+        if (reply != nullptr && reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3 &&
+            reply->element[1] != nullptr && reply->element[1]->str != nullptr &&
+            reply->element[2] != nullptr && reply->element[2]->str != nullptr &&
+            _notify_message_handler)
         {
             // 给业务层上报通道上发生的消息
             _notify_message_handler(atoi(reply->element[1]->str) , reply->element[2]->str);

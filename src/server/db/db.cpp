@@ -1,11 +1,13 @@
 #include "db.h"
+#include "config.hpp"
 #include <muduo/base/Logging.h>
 
 // 数据库配置信息
-static string server = "127.0.0.1";
-static string user = "root";
-static string password = "123456";
-static string dbname = "chat";
+static const string server = chat_config::getEnv("CHAT_DB_HOST", "127.0.0.1");
+static const string user = chat_config::getEnv("CHAT_DB_USER", "chat");
+static const string password = chat_config::getEnv("CHAT_DB_PASSWORD", "chat");
+static const string dbname = chat_config::getEnv("CHAT_DB_NAME", "chat");
+static const unsigned int port = chat_config::getPort("CHAT_DB_PORT", 3306);
 
 /*
  * 函数名直译：MySQL 构造函数。
@@ -50,16 +52,19 @@ MySQL::~MySQL()
 bool MySQL::connect()
 {
     MYSQL *p = mysql_real_connect(_conn, server.c_str(), user.c_str(),
-                                  password.c_str(), dbname.c_str(), 3306, nullptr, 0);
+                                  password.c_str(), dbname.c_str(), port, nullptr, 0);
     if (p != nullptr)
     {
-        // C和C++代码默认的编码字符是ASCII，如果不设置，从MySQL上拉下来的中文显示？
-        mysql_query(_conn, "set names gbk");
+        if (mysql_set_character_set(_conn, "utf8mb4") != 0)
+        {
+            LOG_WARN << "set mysql charset failed: " << mysql_error(_conn);
+        }
         LOG_INFO << "connect mysql success!";
     }
     else
     {
-        LOG_INFO << "connect mysql fail!";
+        LOG_ERROR << "connect mysql " << server << ":" << port
+                  << " failed: " << mysql_error(_conn);
     }
 
     return p;

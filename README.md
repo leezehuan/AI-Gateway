@@ -11,43 +11,81 @@
 - 封装 MySQL 接口，将用户数据储存到磁盘中，实现数据持久化
 - 基于 CMake 构建项目
 
-## 必要环境
+## 在 WSL2 上运行
 
-- 安装`boost`库
-- 安装`muduo`库
-- 安装`Nginx`
-- 安装`redis`
+WSL2 运行的是完整 Linux 内核，本项目不需要改成 Windows 程序。请在 WSL 的
+Ubuntu 终端内编译和运行，并把仓库放在 Linux 文件系统（例如
+`~/Cluster-Chat-Server`）中；不要放在 `/mnt/c`，否则 CMake 编译和文件访问会明显变慢。
 
-## 构建项目
+当前适配并验证的环境为 Ubuntu 24.04。基础运行需要 Muduo、MariaDB/MySQL、
+Redis、hiredis 和 Boost；Nginx 只在学习多服务器负载均衡章节时才需要。
 
-创建数据库
+### 1. 初始化环境
+
+如果课程中的 Muduo 已安装到 `/usr/local`，执行：
 
 ```shell
-# 连接MySQL
-mysql -u root -p your passward
-# 创建数据库
-create database chat;
-# 执行数据库脚本创建表
-source chat.sql
+./scripts/setup-wsl.sh
 ```
 
-执行脚本构建项目
+脚本会安装 Ubuntu 依赖、启动 MariaDB/Redis、创建本地 `chat` 数据库和
+`chat/chat` 教学账号、导入 `chat.sql`，最后编译项目。脚本不会修改数据库 root
+密码。若脚本提示找不到 Muduo，请先按课程步骤安装 Muduo，并确认存在：
 
-```shell
-bash build.sh
+```text
+/usr/local/include/muduo/net/TcpServer.h
+/usr/local/lib/libmuduo_net.a
+/usr/local/lib/libmuduo_base.a
 ```
 
-## 执行生成文件
+WSL 如果没有启用 systemd，应编辑 WSL 内的 `/etc/wsl.conf`：
 
-```shell
-# 启动服务端
-cd ./bin
-./ChatServer 6000 
+```ini
+[boot]
+systemd=true
 ```
 
+然后在 Windows PowerShell 执行 `wsl --shutdown`，重新打开 Ubuntu。项目脚本也保留了
+传统 `service` 命令的兼容路径。
+
+### 2. 配置与编译
+
+连接参数位于项目根目录 `.env`。初始化脚本会由 `.env.example` 自动生成它；也可手动执行：
+
 ```shell
-# 启动客户端
-./ChatClient 127.0.0.1 8000
+cp .env.example .env
+./build.sh
+```
+
+可用配置项：`CHAT_DB_HOST`、`CHAT_DB_PORT`、`CHAT_DB_USER`、
+`CHAT_DB_PASSWORD`、`CHAT_DB_NAME`、`CHAT_REDIS_HOST`、`CHAT_REDIS_PORT`、
+`CHAT_SERVER_IP` 和 `CHAT_SERVER_PORT`。构建产物位于 `build/wsl/bin`；仓库原有
+`bin` 目录中的文件是旧版 Ubuntu 编译产物，不应在 WSL 中直接使用。
+
+### 3. 启动服务端和客户端
+
+打开一个 WSL 终端启动服务端：
+
+```shell
+./scripts/run-server.sh
+```
+
+再打开一个或多个 WSL 终端启动客户端：
+
+```shell
+./scripts/run-client.sh
+```
+
+客户端脚本也接受显式地址和端口，例如 `./scripts/run-client.sh 127.0.0.1 6000`。
+默认服务端监听 `0.0.0.0:6000`，WSL 内客户端使用 `127.0.0.1:6000`。在常规 WSL2
+配置中，Windows 侧也可以通过 `localhost:6000` 访问；从局域网其他机器访问时，还需
+配置 Windows 防火墙与端口转发。
+
+仅需重新编译客户端、不准备数据库等服务时，可以使用：
+
+```shell
+cmake -S . -B build/client -DBUILD_CHAT_SERVER=OFF
+cmake --build build/client
 ```
 
 ![1663830571(1).png](https://syz-picture.oss-cn-shenzhen.aliyuncs.com/D:%5CPrograme%20Files(x86)%5CPicGo1663830578650-52d58f18-370f-426a-b8fe-f07dfd06b116.png)
@@ -178,10 +216,10 @@ void ChatServer::onMessage(const TcpConnectionPtr &conn,
 
 ![](https://cdn.nlark.com/yuque/0/2022/png/26752078/1663732379258-4c925576-3374-4f0d-8274-6031a8366536.png#crop=0&crop=0&crop=1&crop=1&from=url&id=ARrJw&margin=%5Bobject%20Object%5D&originHeight=402&originWidth=810&originalType=binary&ratio=1&rotation=0&showTitle=false&status=done&style=none&title=)
 
-配置好后，重新加载配置文件启动。
+配置好后，重新加载配置文件启动。Ubuntu 24.04/WSL 的软件包安装方式使用：
 
 ```shell
-/usr/local/nginx/sbin/nginx -s reload
+sudo systemctl reload nginx
 ```
 
 ## redis发布-订阅功能解决跨服务器通信问题
@@ -201,4 +239,3 @@ void ChatServer::onMessage(const TcpConnectionPtr &conn,
 ![](https://cdn.nlark.com/yuque/0/2022/png/26752078/1663747534358-10e307b4-95c8-43f3-8dc2-5deed9893f1c.png#crop=0&crop=0&crop=1&crop=1&from=url&id=QproC&margin=%5Bobject%20Object%5D&originHeight=505&originWidth=619&originalType=binary&ratio=1&rotation=0&showTitle=false&status=done&style=none&title=)
 
 # 详细记录
-

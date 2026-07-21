@@ -1,7 +1,7 @@
 #ifndef DB_H
 #define DB_H
 
-#include <mysql/mysql.h>
+#include <mysql.h>
 #include <string>
 using namespace std;
 
