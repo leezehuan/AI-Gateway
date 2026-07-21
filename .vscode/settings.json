@@ -59,5 +59,6 @@
         "ratio": "cpp",
         "thread": "cpp",
         "unordered_set": "cpp"
-    }
+    },
+    "C_Cpp.default.compilerPath": "/usr/bin/g++"
 }
