@@ -1,5 +1,70 @@
 # Cluster-Chat-Server
 
+> Migration status: Phase 0 through Phase 2 add an independent C++ AI API gateway while the legacy
+> chat server remains available as a rollback target. See
+> [`ai-api-gateway-migration-spec.md`](ai-api-gateway-migration-spec.md).
+
+## AI Gateway (Phase 2)
+
+`AiGateway` exposes `GET /healthz`, `GET /readyz`, `GET /v1/models`, and streaming or non-streaming
+`POST /v1/responses`. It uses asynchronous Boost.Beast/Asio for ingress and one process-wide
+libcurl multi transport for upstream requests. SSE responses are incrementally validated and
+relayed with bounded buffering, high/low-water backpressure, upstream cancellation on client
+disconnect, and separate first-event, idle, and maximum-duration timeouts. Distributed quotas,
+multi-tenant MySQL configuration, retries, Provider routing, and failover remain out of scope.
+
+Configure the `AI_GATEWAY_*` values in `.env`, then build and run:
+
+```shell
+cmake -S . -B build/gateway \
+  -DBUILD_CHAT_SERVER=OFF \
+  -DBUILD_CHAT_CLIENT=OFF
+cmake --build build/gateway
+BUILD_DIR=build/gateway ./scripts/run-gateway.sh
+```
+
+Example non-streaming request:
+
+```shell
+curl http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer ${AI_GATEWAY_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-logical-model","input":"hello","stream":false}'
+```
+
+Example streaming request:
+
+```shell
+curl -N http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer ${AI_GATEWAY_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-logical-model","input":"hello","stream":true}'
+```
+
+The stream controls use these defaults:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `AI_GATEWAY_STREAM_PREFETCH_BYTES` | `65536` | Maximum bytes before the first valid business event |
+| `AI_GATEWAY_STREAM_BUFFER_HIGH_WATER_BYTES` | `262144` | Pause upstream reads at this queued-byte watermark |
+| `AI_GATEWAY_STREAM_BUFFER_LOW_WATER_BYTES` | `65536` | Resume upstream reads after draining to this watermark |
+| `AI_GATEWAY_STREAM_IDLE_TIMEOUT_MS` | `60000` | Maximum unpaused interval without upstream bytes |
+| `AI_GATEWAY_STREAM_MAX_DURATION_MS` | `900000` | Total stream duration including paused time |
+
+The low watermark must be below the high watermark, and prefetch must not exceed the high
+watermark. The Nginx HTTP/1.1 reverse-proxy example for SSE is
+[`deploy/nginx/ai-gateway.conf.example`](deploy/nginx/ai-gateway.conf.example).
+
+Run the localhost integration test with:
+
+```shell
+ctest --test-dir build/gateway --output-on-failure
+```
+
+The captured Codex client requests `stream=true`; its request and event contract is covered by the
+Phase 2 localhost Provider fixture. Architectural decisions and the captured contract are in
+`docs/adr/` and `docs/compatibility/`.
+
 在 Linux 环境下基于 muduo 开发的集群聊天服务器。实现新用户注册、用户登录、添加好友、添加群组、好友通信、群组聊天、保持离线消息等功能。
 
 ## 项目特点
@@ -18,7 +83,7 @@ Ubuntu 终端内编译和运行，并把仓库放在 Linux 文件系统（例如
 `~/Cluster-Chat-Server`）中；不要放在 `/mnt/c`，否则 CMake 编译和文件访问会明显变慢。
 
 当前适配并验证的环境为 Ubuntu 24.04。基础运行需要 Muduo、MariaDB/MySQL、
-Redis、hiredis 和 Boost；Nginx 只在学习多服务器负载均衡章节时才需要。
+Redis、hiredis、Boost 和 libcurl；Nginx 只在学习多服务器负载均衡章节时才需要。
 
 ### 1. 初始化环境
 
@@ -28,9 +93,10 @@ Redis、hiredis 和 Boost；Nginx 只在学习多服务器负载均衡章节时�
 ./scripts/setup-wsl.sh
 ```
 
-脚本会安装 Ubuntu 依赖、启动 MariaDB/Redis、创建本地 `chat` 数据库和
-`chat/chat` 教学账号、导入 `chat.sql`，最后编译项目。脚本不会修改数据库 root
-密码。若脚本提示找不到 Muduo，请先按课程步骤安装 Muduo，并确认存在：
+脚本会安装 Ubuntu 依赖、启动 MariaDB/Redis、创建本地数据库账号、导入
+`chat.sql`，最后编译项目。首次运行前必须通过环境变量或 `.env` 设置
+`CHAT_DB_PASSWORD`；脚本不会再创建固定的教学密码，也不会修改数据库 root 密码。
+若脚本提示找不到 Muduo，请先按课程步骤安装 Muduo，并确认存在：
 
 ```text
 /usr/local/include/muduo/net/TcpServer.h
@@ -50,7 +116,8 @@ systemd=true
 
 ### 2. 配置与编译
 
-连接参数位于项目根目录 `.env`。初始化脚本会由 `.env.example` 自动生成它；也可手动执行：
+连接参数位于项目根目录 `.env`。初始化脚本会由 `.env.example` 自动生成它，但不会
+把交互输入的密码写回磁盘；运行服务前应显式填写密钥。也可手动执行：
 
 ```shell
 cp .env.example .env

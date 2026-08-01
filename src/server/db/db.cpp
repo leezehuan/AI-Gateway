@@ -5,7 +5,8 @@
 // 数据库配置信息
 static const string server = chat_config::getEnv("CHAT_DB_HOST", "127.0.0.1");
 static const string user = chat_config::getEnv("CHAT_DB_USER", "chat");
-static const string password = chat_config::getEnv("CHAT_DB_PASSWORD", "chat");
+// Fail closed when the legacy database password is not configured.
+static const string password = chat_config::getEnv("CHAT_DB_PASSWORD", "");
 static const string dbname = chat_config::getEnv("CHAT_DB_NAME", "chat");
 static const unsigned int port = chat_config::getPort("CHAT_DB_PORT", 3306);
 
@@ -86,8 +87,7 @@ bool MySQL::update(string sql)
 {
     if (mysql_query(_conn, sql.c_str()))
     {
-        LOG_INFO << __FILE__ << ":" << __LINE__ << ":"
-                 << sql << "更新失败!";
+        LOG_ERROR << "legacy mysql update failed: " << mysql_error(_conn);
         return false;
     }
 
@@ -112,8 +112,7 @@ MYSQL_RES *MySQL::query(string sql)
 {
     if (mysql_query(_conn, sql.c_str()))
     {
-        LOG_INFO << __FILE__ << ":" << __LINE__ << ":"
-                 << sql << "查询失败!";
+        LOG_ERROR << "legacy mysql query failed: " << mysql_error(_conn);
         return nullptr;
     }
     

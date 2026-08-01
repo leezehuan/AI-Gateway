@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(ClusterChatServer LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 11)
+include(CTest)
+
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -22,5 +24,6 @@ include_directories(
 
 option(BUILD_CHAT_SERVER "Build the chat server" ON)
 option(BUILD_CHAT_CLIENT "Build the chat client" ON)
+option(BUILD_AI_GATEWAY "Build the AI API gateway" ON)
 
 add_subdirectory(src)
