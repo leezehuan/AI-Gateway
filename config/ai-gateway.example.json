@@ -1,0 +1,51 @@
+{
+  "tenants": [
+    {"slug": "example", "name": "Example Tenant", "status": "active"}
+  ],
+  "providers": [
+    {
+      "tenant": "example",
+      "slug": "openai",
+      "name": "OpenAI",
+      "status": "active",
+      "endpoints": [
+        {
+          "name": "responses",
+          "protocol": "responses",
+          "url": "https://api.openai.com/v1/responses",
+          "status": "active"
+        }
+      ],
+      "credentials": [
+        {"name": "default", "secret_ref": "env:OPENAI_API_KEY", "status": "active"}
+      ]
+    }
+  ],
+  "logical_models": [
+    {"tenant": "example", "protocol": "responses", "name": "codex", "status": "active"}
+  ],
+  "policies": [
+    {
+      "tenant": "example",
+      "slug": "default",
+      "name": "Default",
+      "status": "active",
+      "protocols": ["responses"],
+      "models": ["codex"],
+      "providers": ["openai"]
+    }
+  ],
+  "mappings": [
+    {
+      "tenant": "example",
+      "protocol": "responses",
+      "logical_model": "codex",
+      "name": "primary",
+      "provider": "openai",
+      "endpoint": "responses",
+      "credential": "default",
+      "upstream_model": "gpt-5.2-codex",
+      "status": "active"
+    }
+  ]
+}

@@ -5,14 +5,24 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-GATEWAY_KEY = "gateway-test-key-0123456789-abcdefghijklmnopqrstuvwxyz"
+GATEWAY_KEY = ""
+TENANT_B_KEY = ""
+EXPIRED_KEY = ""
+DISABLED_KEY = ""
+DISABLED_TENANT_KEY = ""
+DISABLED_POLICY_KEY = ""
+PROTOCOL_DENY_KEY = ""
+MODEL_DENY_KEY = ""
+PROVIDER_DENY_KEY = ""
 PROVIDER_KEY = "provider-test-key-0123456789-abcdefghijklmnopqrstuvwxyz"
+PROVIDER_KEY_B = "provider-b-test-key-0123456789-abcdefghijklmnopqrstuv"
 
 
 def free_port():
@@ -378,7 +388,12 @@ class MockProviderHandler(BaseHTTPRequestHandler):
 class GatewayIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        global GATEWAY_KEY, TENANT_B_KEY, EXPIRED_KEY, DISABLED_KEY
+        global DISABLED_TENANT_KEY, DISABLED_POLICY_KEY
+        global PROTOCOL_DENY_KEY, MODEL_DENY_KEY, PROVIDER_DENY_KEY
         cls.gateway_binary = sys.argv[1]
+        cls.admin_binary = sys.argv[2]
+        cls.repo = sys.argv[3]
         cls.provider_state = MockProviderState()
         cls.provider_port = free_port()
         cls.provider = ThreadingHTTPServer(("127.0.0.1", cls.provider_port), MockProviderHandler)
@@ -386,17 +401,86 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.provider_thread = threading.Thread(target=cls.provider.serve_forever, daemon=True)
         cls.provider_thread.start()
 
+        cls.database_temp = tempfile.TemporaryDirectory(prefix="aigw-http-")
+        cls.secret_dir = os.path.join(cls.database_temp.name, "secrets")
+        os.mkdir(cls.secret_dir)
+        cls.database_dir = os.path.join(cls.database_temp.name, "data")
+        cls.database_socket = os.path.join(cls.database_temp.name, "mariadb.sock")
+        cls.database_port = free_port()
+        subprocess.run(
+            ["mariadb-install-db", "--no-defaults", f"--datadir={cls.database_dir}",
+             "--auth-root-authentication-method=normal", "--skip-test-db"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        cls.database = subprocess.Popen(
+            ["mariadbd", "--no-defaults", f"--datadir={cls.database_dir}",
+             f"--socket={cls.database_socket}", f"--port={cls.database_port}",
+             "--bind-address=127.0.0.1", "--skip-name-resolve",
+             f"--pid-file={cls.database_temp.name}/mariadb.pid",
+             f"--log-error={cls.database_temp.name}/mariadb.log"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            probe = subprocess.run(
+                ["mariadb", "--no-defaults", f"--socket={cls.database_socket}",
+                 "-u", "root", "-e", "SELECT 1"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if probe.returncode == 0:
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("temporary MariaDB did not start")
+        subprocess.run(
+            ["mariadb", "--no-defaults", f"--socket={cls.database_socket}", "-u", "root", "-e",
+             "CREATE DATABASE ai_gateway; CREATE USER 'gateway'@'127.0.0.1' IDENTIFIED BY 'test-db-password'; "
+             "GRANT ALL ON ai_gateway.* TO 'gateway'@'127.0.0.1'; FLUSH PRIVILEGES;"],
+            check=True,
+        )
+        cls.run_admin("migrate", "--dir", os.path.join(cls.repo, "migrations", "gateway"))
+        config = cls.phase3_config()
+        config_path = os.path.join(cls.database_temp.name, "config.json")
+        with open(config_path, "w", encoding="utf-8") as output:
+            json.dump(config, output)
+        cls.run_admin("apply-config", "--file", config_path)
+        GATEWAY_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default", "--name", "phase2-regression"
+        ).stdout.strip()
+        TENANT_B_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-b", "--policy", "default", "--name", "tenant-b-key"
+        ).stdout.strip()
+        EXPIRED_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default", "--name", "expired",
+            "--expires-at", "2000-01-01T00:00:00Z"
+        ).stdout.strip()
+        DISABLED_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default", "--name", "disabled"
+        ).stdout.strip()
+        disabled_key_id = cls.database_query(
+            f"SELECT key_id FROM api_keys WHERE display_prefix='{DISABLED_KEY[5:17]}'"
+        ).strip()
+        cls.run_admin("set-key-status", "--key-id", disabled_key_id, "--status", "disabled")
+        DISABLED_TENANT_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-disabled", "--policy", "default", "--name", "disabled-tenant"
+        ).stdout.strip()
+        DISABLED_POLICY_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-policy", "--policy", "disabled", "--name", "disabled-policy"
+        ).stdout.strip()
+        PROTOCOL_DENY_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "protocol-deny", "--name", "protocol-deny"
+        ).stdout.strip()
+        MODEL_DENY_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "model-deny", "--name", "model-deny"
+        ).stdout.strip()
+        PROVIDER_DENY_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "provider-deny", "--name", "provider-deny"
+        ).stdout.strip()
+
         cls.gateway_port = free_port()
-        environment = os.environ.copy()
+        environment = cls.gateway_environment(cls.gateway_port)
         environment.update(
             {
-                "AI_GATEWAY_LISTEN_ADDRESS": "127.0.0.1",
-                "AI_GATEWAY_LISTEN_PORT": str(cls.gateway_port),
-                "AI_GATEWAY_API_KEY": GATEWAY_KEY,
-                "AI_GATEWAY_PROVIDER_RESPONSES_URL": f"http://127.0.0.1:{cls.provider_port}/v1/responses",
-                "AI_GATEWAY_PROVIDER_API_KEY": PROVIDER_KEY,
-                "AI_GATEWAY_LOGICAL_MODEL": "gateway-model",
-                "AI_GATEWAY_UPSTREAM_MODEL": "provider-model",
                 "AI_GATEWAY_MAX_BODY_BYTES": "1024",
                 "AI_GATEWAY_MAX_RESPONSE_BYTES": "2048",
                 "AI_GATEWAY_UPSTREAM_TIMEOUT_MS": "500",
@@ -427,6 +511,145 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.wait_for_gateway()
 
     @classmethod
+    def gateway_environment(cls, listen_port):
+        environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("AI_GATEWAY_")
+        }
+        environment.update({
+            "AI_GATEWAY_LISTEN_ADDRESS": "127.0.0.1",
+            "AI_GATEWAY_LISTEN_PORT": str(listen_port),
+            "AI_GATEWAY_DB_HOST": "127.0.0.1",
+            "AI_GATEWAY_DB_PORT": str(cls.database_port),
+            "AI_GATEWAY_DB_USER": "gateway",
+            "AI_GATEWAY_DB_PASSWORD": "test-db-password",
+            "AI_GATEWAY_DB_NAME": "ai_gateway",
+            "AI_GATEWAY_DB_CONNECT_TIMEOUT_SECONDS": "1",
+            "AI_GATEWAY_DB_POOL_SIZE": "2",
+            "AI_GATEWAY_DB_WORKERS": "2",
+            "AI_GATEWAY_DB_QUEUE_SIZE": "128",
+            "AI_GATEWAY_AUTH_CACHE_TTL_SECONDS": "30",
+            "AI_GATEWAY_AUTH_CACHE_MAX_ENTRIES": "100",
+            "AI_GATEWAY_CONFIG_POLL_INTERVAL_MS": "200",
+            "AI_GATEWAY_API_KEY_HMAC_PEPPER": "phase3-test-pepper-that-is-at-least-32-bytes",
+            "AI_GATEWAY_SECRET_DIR": cls.secret_dir,
+            "TEST_PROVIDER_SECRET_A": PROVIDER_KEY,
+            "TEST_PROVIDER_SECRET_B": PROVIDER_KEY_B,
+        })
+        return environment
+
+    @classmethod
+    def run_admin(cls, *arguments, check=True):
+        result = subprocess.run(
+            [cls.admin_binary, *arguments], env=cls.gateway_environment(1), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if check and result.returncode != 0:
+            raise RuntimeError(f"AiGatewayAdmin failed: {result.stderr}")
+        return result
+
+    @classmethod
+    def database_query(cls, sql):
+        result = subprocess.run(
+            ["mariadb", "--no-defaults", "-h", "127.0.0.1", "-P", str(cls.database_port),
+             "-u", "gateway", "-ptest-db-password", "-N", "ai_gateway", "-e", sql],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return result.stdout
+
+    @classmethod
+    def apply_config_patch(cls, config, filename="patch.json"):
+        path = os.path.join(cls.database_temp.name, filename)
+        with open(path, "w", encoding="utf-8") as output:
+            json.dump(config, output)
+        return cls.run_admin("apply-config", "--file", path)
+
+    @classmethod
+    def public_key_id(cls, key):
+        return cls.database_query(
+            f"SELECT key_id FROM api_keys WHERE display_prefix='{key[5:17]}'"
+        ).strip()
+
+    @classmethod
+    def wait_for_model(cls, model="gateway-model", timeout=3):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status, _, body = cls.request(
+                "GET", "/v1/models", headers={"Authorization": f"Bearer {GATEWAY_KEY}"}
+            )
+            if status == 200 and model in [entry["id"] for entry in json.loads(body)["data"]]:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"model {model} did not become available")
+
+    @classmethod
+    def phase3_config(cls):
+        endpoint = f"http://127.0.0.1:{cls.provider_port}/v1/responses"
+        return {
+            "tenants": [
+                {"slug": "tenant-a", "name": "Tenant A", "status": "active"},
+                {"slug": "tenant-b", "name": "Tenant B", "status": "active"},
+                {"slug": "tenant-disabled", "name": "Disabled Tenant", "status": "disabled"},
+                {"slug": "tenant-policy", "name": "Policy Tenant", "status": "active"},
+            ],
+            "providers": [
+                {"tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
+                 "status": "active",
+                 "endpoints": [{"name": "responses", "protocol": "responses",
+                                "url": endpoint, "status": "active"}],
+                 "credentials": [{"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_A",
+                                  "status": "active"}]},
+                {"tenant": "tenant-b", "slug": "provider-b", "name": "Provider B",
+                 "status": "active",
+                 "endpoints": [{"name": "responses", "protocol": "responses",
+                                "url": endpoint, "status": "active"}],
+                 "credentials": [{"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_B",
+                                  "status": "active"}]},
+            ],
+            "logical_models": [
+                {"tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
+                 "status": "active"},
+                {"tenant": "tenant-b", "protocol": "responses", "name": "gateway-model",
+                 "status": "active"},
+                {"tenant": "tenant-b", "protocol": "responses", "name": "tenant-b-only",
+                 "status": "active"},
+            ],
+            "policies": [
+                {"tenant": "tenant-a", "slug": "default", "name": "Default A",
+                 "status": "active", "protocols": ["responses"],
+                 "models": ["gateway-model"], "providers": ["provider-a"]},
+                {"tenant": "tenant-b", "slug": "default", "name": "Default B",
+                 "status": "active", "protocols": ["responses"],
+                 "models": ["gateway-model", "tenant-b-only"], "providers": ["provider-b"]},
+                {"tenant": "tenant-a", "slug": "protocol-deny", "name": "Protocol Deny",
+                 "status": "active", "protocols": [{"name": "responses", "enabled": False}],
+                 "models": ["gateway-model"], "providers": ["provider-a"]},
+                {"tenant": "tenant-a", "slug": "model-deny", "name": "Model Deny",
+                 "status": "active", "protocols": ["responses"],
+                 "models": [{"name": "gateway-model", "enabled": False}],
+                 "providers": ["provider-a"]},
+                {"tenant": "tenant-a", "slug": "provider-deny", "name": "Provider Deny",
+                 "status": "active", "protocols": ["responses"], "models": ["gateway-model"],
+                 "providers": [{"name": "provider-a", "enabled": False}]},
+                {"tenant": "tenant-disabled", "slug": "default", "name": "Default",
+                 "status": "active"},
+                {"tenant": "tenant-policy", "slug": "disabled", "name": "Disabled",
+                 "status": "disabled"},
+            ],
+            "mappings": [
+                {"tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+                 "name": "primary", "provider": "provider-a", "endpoint": "responses",
+                 "credential": "default", "upstream_model": "provider-model", "status": "active"},
+                {"tenant": "tenant-b", "protocol": "responses", "logical_model": "gateway-model",
+                 "name": "primary", "provider": "provider-b", "endpoint": "responses",
+                 "credential": "default", "upstream_model": "provider-model-b", "status": "active"},
+                {"tenant": "tenant-b", "protocol": "responses", "logical_model": "tenant-b-only",
+                 "name": "primary", "provider": "provider-b", "endpoint": "responses",
+                 "credential": "default", "upstream_model": "provider-model-b-only", "status": "active"},
+            ],
+        }
+
+    @classmethod
     def tearDownClass(cls):
         cls.gateway.terminate()
         try:
@@ -438,6 +661,9 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.log_thread.join(timeout=1)
         cls.provider.shutdown()
         cls.provider.server_close()
+        cls.database.terminate()
+        cls.database.wait(timeout=5)
+        cls.database_temp.cleanup()
 
     @classmethod
     def wait_for_gateway(cls):
@@ -446,7 +672,9 @@ class GatewayIntegrationTest(unittest.TestCase):
             try:
                 status, _, _ = cls.request("GET", "/healthz")
                 if status == 200:
-                    return
+                    ready, _, _ = cls.request("GET", "/readyz")
+                    if ready == 200:
+                        return
             except OSError:
                 pass
             time.sleep(0.05)
@@ -486,19 +714,485 @@ class GatewayIntegrationTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["id"], "gateway-model")
 
+    def test_phase3_tenants_resolve_the_same_name_independently(self):
+        self.provider_state.reset()
+        status, _, _ = self.request(
+            "POST", "/v1/responses",
+            json.dumps({"model": "gateway-model", "input": "tenant b"}),
+            {"Authorization": f"Bearer {TENANT_B_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        _, requests = self.provider_state.snapshot()
+        self.assertEqual(requests[-1]["payload"]["model"], "provider-model-b")
+        self.assertEqual(requests[-1]["headers"]["authorization"], f"Bearer {PROVIDER_KEY_B}")
+        self.assertNotEqual(requests[-1]["headers"]["authorization"], f"Bearer {TENANT_B_KEY}")
+
+        status, _, body = self.request(
+            "POST", "/v1/responses",
+            json.dumps({"model": "tenant-b-only", "input": "cross tenant"}),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"]["code"], "model_not_allowed")
+
+        status, _, body = self.request(
+            "GET", "/v1/models", headers={"Authorization": f"Bearer {TENANT_B_KEY}"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [model["id"] for model in json.loads(body)["data"]],
+            ["gateway-model", "tenant-b-only"],
+        )
+
+    def test_phase3_key_status_and_policy_grants_fail_closed(self):
+        unknown_key = GATEWAY_KEY[:-1] + ("A" if GATEWAY_KEY[-1] != "A" else "B")
+        for key in ("malformed", unknown_key, DISABLED_KEY, EXPIRED_KEY):
+            status, _, body = self.request(
+                "GET", "/v1/models", headers={"Authorization": f"Bearer {key}"}
+            )
+            self.assertEqual(status, 401, key[:20])
+            self.assertEqual(json.loads(body)["error"]["code"], "invalid_api_key")
+
+        for key in (DISABLED_TENANT_KEY, DISABLED_POLICY_KEY):
+            status, _, body = self.request(
+                "GET", "/v1/models", headers={"Authorization": f"Bearer {key}"}
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(json.loads(body)["error"]["code"], "access_disabled")
+
+        status, _, body = self.request(
+            "POST", "/v1/responses",
+            json.dumps({"model": "gateway-model", "input": "denied"}),
+            {"Authorization": f"Bearer {PROTOCOL_DENY_KEY}"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"]["code"], "protocol_not_allowed")
+
+        for key in (MODEL_DENY_KEY, PROVIDER_DENY_KEY):
+            status, _, body = self.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "denied"}),
+                {"Authorization": f"Bearer {key}"},
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(json.loads(body)["error"]["code"], "model_not_allowed")
+
+        status, _, body = self.request(
+            "GET", "/v1/models", headers={"Authorization": f"Bearer {PROVIDER_DENY_KEY}"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"], [])
+
+    def test_phase3_database_outage_fails_cached_auth_closed_and_recovers(self):
+        self.assertEqual(
+            self.request("GET", "/v1/models",
+                         headers={"Authorization": f"Bearer {GATEWAY_KEY}"})[0],
+            200,
+        )
+        self.database.terminate()
+        self.database.wait(timeout=5)
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            status, _, _ = self.request("GET", "/readyz")
+            if status == 503:
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, 503)
+
+        started = time.time()
+        health_status, _, _ = self.request("GET", "/healthz")
+        self.assertEqual(health_status, 200)
+        self.assertLess(time.time() - started, 0.5)
+        status, _, body = self.request(
+            "GET", "/v1/models", headers={"Authorization": f"Bearer {GATEWAY_KEY}"}
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error"]["code"], "authorization_unavailable")
+
+        type(self).database = subprocess.Popen(
+            ["mariadbd", "--no-defaults", f"--datadir={self.database_dir}",
+             f"--socket={self.database_socket}", f"--port={self.database_port}",
+             "--bind-address=127.0.0.1", "--skip-name-resolve",
+             f"--pid-file={self.database_temp.name}/mariadb.pid",
+             f"--log-error={self.database_temp.name}/mariadb.log"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                status, _, _ = self.request("GET", "/readyz")
+                if status == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            self.request("GET", "/v1/models",
+                         headers={"Authorization": f"Bearer {GATEWAY_KEY}"})[0],
+            200,
+        )
+
+    def test_phase3_schema_mismatch_fails_readiness_and_recovers(self):
+        self.database_query(
+            "INSERT INTO schema_migrations(version, checksum) VALUES "
+            "('9999_future_schema', REPEAT('0', 64))"
+        )
+        try:
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                status, _, _ = self.request("GET", "/readyz")
+                if status == 503:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status, 503)
+            self.assertEqual(self.request("GET", "/healthz")[0], 200)
+        finally:
+            self.database_query(
+                "DELETE FROM schema_migrations WHERE version='9999_future_schema'"
+            )
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            status, _, _ = self.request("GET", "/readyz")
+            if status == 200:
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, 200)
+
+    def test_phase3_slow_database_auth_does_not_block_health(self):
+        locker = subprocess.Popen(
+            ["mariadb", "--no-defaults", "-h", "127.0.0.1", "-P", str(self.database_port),
+             "-u", "gateway", "-ptest-db-password", "ai_gateway", "-e",
+             "LOCK TABLES api_keys WRITE; DO SLEEP(1.2); UNLOCK TABLES"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.1)
+        unknown_key = "aigw_ABCDEFGHIJKL_" + "A" * 43
+        result = {}
+
+        def authenticate():
+            result["response"] = self.request(
+                "GET", "/v1/models",
+                headers={"Authorization": f"Bearer {unknown_key}"}, timeout=3,
+            )
+
+        thread = threading.Thread(target=authenticate)
+        thread.start()
+        time.sleep(0.1)
+        started = time.time()
+        status, _, _ = self.request("GET", "/healthz")
+        elapsed = time.time() - started
+        thread.join(timeout=4)
+        locker.wait(timeout=4)
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(result["response"][0], 401)
+
+    def test_phase3_database_worker_queue_saturation_returns_503(self):
+        port = free_port()
+        environment = self.gateway_environment(port)
+        environment.update({
+            "AI_GATEWAY_DB_POOL_SIZE": "1",
+            "AI_GATEWAY_DB_WORKERS": "1",
+            "AI_GATEWAY_DB_QUEUE_SIZE": "1",
+            "AI_GATEWAY_CONFIG_POLL_INTERVAL_MS": "60000",
+        })
+        process = subprocess.Popen(
+            [self.gateway_binary], env=environment,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        locker = None
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+                    connection.request("GET", "/readyz")
+                    response = connection.getresponse()
+                    response.read()
+                    connection.close()
+                    if response.status == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            self.assertEqual(response.status, 200)
+
+            locker = subprocess.Popen(
+                ["mariadb", "--no-defaults", "-h", "127.0.0.1", "-P", str(self.database_port),
+                 "-u", "gateway", "-ptest-db-password", "ai_gateway", "-e",
+                 "LOCK TABLES api_keys WRITE; DO SLEEP(1.5); UNLOCK TABLES"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.1)
+            results = []
+
+            def authenticate(index):
+                prefix = chr(ord("A") + index) * 12
+                key = f"aigw_{prefix}_{'A' * 43}"
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
+                connection.request("GET", "/v1/models", headers={"Authorization": f"Bearer {key}"})
+                response = connection.getresponse()
+                body = response.read()
+                results.append((response.status, body))
+                connection.close()
+
+            threads = []
+            for index in range(3):
+                thread = threading.Thread(target=authenticate, args=(index,))
+                thread.start()
+                threads.append(thread)
+                time.sleep(0.05)
+
+            started = time.time()
+            health = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            health.request("GET", "/healthz")
+            health_response = health.getresponse()
+            health_response.read()
+            health.close()
+            elapsed = time.time() - started
+            for thread in threads:
+                thread.join(timeout=4)
+            self.assertEqual(health_response.status, 200)
+            self.assertLess(elapsed, 0.5)
+            self.assertEqual(len(results), 3)
+            unavailable = [body for status, body in results if status == 503]
+            self.assertTrue(unavailable)
+            self.assertTrue(all(
+                json.loads(body)["error"]["code"] == "authorization_unavailable"
+                for body in unavailable
+            ))
+        finally:
+            if locker is not None:
+                locker.wait(timeout=4)
+            process.terminate()
+            process.wait(timeout=5)
+
+    def test_phase3_prepared_admin_input_and_database_are_secret_free(self):
+        injected_name = "key'); DROP TABLE tenants; --"
+        key = self.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default", "--name", injected_name
+        ).stdout.strip()
+        status, _, _ = self.request(
+            "GET", "/v1/models", headers={"Authorization": f"Bearer {key}"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.database_query("SELECT COUNT(*) FROM tenants").strip(), "4")
+        dump = subprocess.run(
+            ["mariadb-dump", "--no-defaults", "-h", "127.0.0.1", "-P", str(self.database_port),
+             "-u", "gateway", "-ptest-db-password", "--skip-comments", "ai_gateway"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ).stdout
+        self.assertNotIn(key.encode(), dump)
+        self.assertNotIn(GATEWAY_KEY.encode(), dump)
+        self.assertNotIn(TENANT_B_KEY.encode(), dump)
+        self.assertNotIn(PROVIDER_KEY.encode(), dump)
+        self.assertNotIn(PROVIDER_KEY_B.encode(), dump)
+        self.assertNotIn(b"prompt-never-log", dump)
+        self.assertNotIn(b"event-body-never-log", dump)
+
+    def test_phase3_version_invalidation_updates_key_and_mapping_without_restart(self):
+        key_id = self.public_key_id(GATEWAY_KEY)
+        self.assertEqual(
+            self.request("GET", "/v1/models",
+                         headers={"Authorization": f"Bearer {GATEWAY_KEY}"})[0],
+            200,
+        )
+        try:
+            self.run_admin("set-key-status", "--key-id", key_id, "--status", "disabled")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                status, _, body = self.request(
+                    "GET", "/v1/models", headers={"Authorization": f"Bearer {GATEWAY_KEY}"}
+                )
+                if status == 401:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(body)["error"]["code"], "invalid_api_key")
+        finally:
+            self.run_admin("set-key-status", "--key-id", key_id, "--status", "active")
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            status, _, _ = self.request(
+                "GET", "/v1/models", headers={"Authorization": f"Bearer {GATEWAY_KEY}"}
+            )
+            if status == 200:
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, 200)
+
+        mapping = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "primary", "provider": "provider-a", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-model-updated", "status": "active",
+        }
+        before = int(self.database_query(
+            "SELECT version FROM gateway_config_versions WHERE singleton_id=1"
+        ).strip())
+        try:
+            self.apply_config_patch({"mappings": [mapping]}, "mapping-update.json")
+            after = int(self.database_query(
+                "SELECT version FROM gateway_config_versions WHERE singleton_id=1"
+            ).strip())
+            self.assertEqual(after, before + 1)
+            deadline = time.time() + 2
+            observed = None
+            while time.time() < deadline:
+                self.provider_state.reset()
+                status, _, _ = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "version"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                if status == 200:
+                    _, requests = self.provider_state.snapshot()
+                    if requests:
+                        observed = requests[-1]["payload"]["model"]
+                if observed == "provider-model-updated":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(observed, "provider-model-updated")
+        finally:
+            mapping["upstream_model"] = "provider-model"
+            self.apply_config_patch({"mappings": [mapping]}, "mapping-restore.json")
+            self.wait_for_model()
+
+    def test_phase3_missing_secret_and_duplicate_mapping_are_unavailable(self):
+        provider = {
+            "tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
+            "status": "active", "credentials": [
+                {"name": "default", "secret_ref": "env:MISSING_PROVIDER_SECRET",
+                 "status": "active"}
+            ],
+        }
+        try:
+            self.apply_config_patch({"providers": [provider]}, "missing-secret.json")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                status, _, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "secret"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                if status == 503:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)["error"]["code"], "model_unavailable")
+            self.assertNotIn("MISSING_PROVIDER_SECRET", body.decode())
+        finally:
+            provider["credentials"][0]["secret_ref"] = "env:TEST_PROVIDER_SECRET_A"
+            self.apply_config_patch({"providers": [provider]}, "secret-restore.json")
+            self.wait_for_model()
+
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "secondary", "provider": "provider-a", "endpoint": "responses",
+            "credential": "default", "upstream_model": "duplicate-provider-model",
+            "status": "active",
+        }
+        try:
+            self.apply_config_patch({"mappings": [secondary]}, "duplicate-mapping.json")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                status, _, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "duplicate"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                if status == 503:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)["error"]["code"], "model_unavailable")
+        finally:
+            secondary["status"] = "disabled"
+            self.apply_config_patch({"mappings": [secondary]}, "duplicate-restore.json")
+            self.wait_for_model()
+
+    def test_phase3_file_secret_rejects_traversal_symlinks_and_oversized_files(self):
+        secret_path = os.path.join(self.secret_dir, "provider.key")
+        with open(secret_path, "w", encoding="ascii") as output:
+            output.write("provider-key-from-file\n")
+        provider = {
+            "tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
+            "status": "active", "credentials": [
+                {"name": "default", "secret_ref": "file:provider.key", "status": "active"}
+            ],
+        }
+        try:
+            self.apply_config_patch({"providers": [provider]}, "file-secret.json")
+            deadline = time.time() + 2
+            observed = None
+            while time.time() < deadline:
+                self.provider_state.reset()
+                status, _, _ = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "file secret"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                _, requests = self.provider_state.snapshot()
+                if status == 200 and requests:
+                    observed = requests[-1]["headers"].get("authorization")
+                if observed == "Bearer provider-key-from-file":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(observed, "Bearer provider-key-from-file")
+
+            traversal = dict(provider)
+            traversal["credentials"] = [
+                {"name": "default", "secret_ref": "file:../provider.key", "status": "active"}
+            ]
+            path = os.path.join(self.database_temp.name, "traversal.json")
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump({"providers": [traversal]}, output)
+            rejected = self.run_admin("apply-config", "--file", path, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("secret_ref", rejected.stderr)
+
+            os.symlink(secret_path, os.path.join(self.secret_dir, "linked.key"))
+            provider["credentials"][0]["secret_ref"] = "file:linked.key"
+            self.apply_config_patch({"providers": [provider]}, "symlink-secret.json")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                status, _, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "symlink"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                if status == 503:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)["error"]["code"], "model_unavailable")
+
+            with open(os.path.join(self.secret_dir, "oversized.key"), "wb") as output:
+                output.write(b"x" * (64 * 1024 + 1))
+            provider["credentials"][0]["secret_ref"] = "file:oversized.key"
+            self.apply_config_patch({"providers": [provider]}, "oversized-secret.json")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                status, _, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "oversized"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                if status == 503:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)["error"]["code"], "model_unavailable")
+        finally:
+            provider["credentials"][0]["secret_ref"] = "env:TEST_PROVIDER_SECRET_A"
+            self.apply_config_patch({"providers": [provider]}, "file-secret-restore.json")
+            self.wait_for_model()
+
     def test_readiness_fails_closed_when_configuration_is_missing(self):
         port = free_port()
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("AI_GATEWAY_")
-        }
-        environment.update(
-            {
-                "AI_GATEWAY_LISTEN_ADDRESS": "127.0.0.1",
-                "AI_GATEWAY_LISTEN_PORT": str(port),
-            }
-        )
+        environment = self.gateway_environment(port)
+        environment["AI_GATEWAY_DB_PORT"] = str(free_port())
         process = subprocess.Popen(
             [self.gateway_binary],
             env=environment,
@@ -526,20 +1220,7 @@ class GatewayIntegrationTest(unittest.TestCase):
             process.wait(timeout=5)
 
     def test_invalid_stream_watermarks_fail_at_startup(self):
-        base = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("AI_GATEWAY_")
-        }
-        base.update(
-            {
-                "AI_GATEWAY_API_KEY": GATEWAY_KEY,
-                "AI_GATEWAY_PROVIDER_RESPONSES_URL": f"http://127.0.0.1:{self.provider_port}/v1/responses",
-                "AI_GATEWAY_PROVIDER_API_KEY": PROVIDER_KEY,
-                "AI_GATEWAY_LOGICAL_MODEL": "gateway-model",
-                "AI_GATEWAY_UPSTREAM_MODEL": "provider-model",
-            }
-        )
+        base = self.gateway_environment(free_port())
         for values, message in [
             (
                 {
@@ -861,16 +1542,9 @@ class GatewayIntegrationTest(unittest.TestCase):
     def test_slow_client_backpressures_and_resumes_without_event_loss(self):
         self.provider_state.reset("stream_backpressure")
         gateway_port = free_port()
-        environment = os.environ.copy()
+        environment = self.gateway_environment(gateway_port)
         environment.update(
             {
-                "AI_GATEWAY_LISTEN_ADDRESS": "127.0.0.1",
-                "AI_GATEWAY_LISTEN_PORT": str(gateway_port),
-                "AI_GATEWAY_API_KEY": GATEWAY_KEY,
-                "AI_GATEWAY_PROVIDER_RESPONSES_URL": f"http://127.0.0.1:{self.provider_port}/v1/responses",
-                "AI_GATEWAY_PROVIDER_API_KEY": PROVIDER_KEY,
-                "AI_GATEWAY_LOGICAL_MODEL": "gateway-model",
-                "AI_GATEWAY_UPSTREAM_MODEL": "provider-model",
                 "AI_GATEWAY_MAX_BODY_BYTES": "1024",
                 "AI_GATEWAY_MAX_RESPONSE_BYTES": str(20 * 1024 * 1024),
                 "AI_GATEWAY_UPSTREAM_TIMEOUT_MS": "1000",
@@ -901,10 +1575,12 @@ class GatewayIntegrationTest(unittest.TestCase):
             while True:
                 try:
                     probe = http.client.HTTPConnection("127.0.0.1", gateway_port, timeout=1)
-                    probe.request("GET", "/healthz")
-                    probe.getresponse().read()
+                    probe.request("GET", "/readyz")
+                    ready_response = probe.getresponse()
+                    ready_response.read()
                     probe.close()
-                    break
+                    if ready_response.status == 200:
+                        break
                 except OSError:
                     if time.time() >= deadline:
                         self.fail("backpressure AiGateway did not start")
@@ -1071,7 +1747,9 @@ class GatewayIntegrationTest(unittest.TestCase):
         time.sleep(0.05)
         logs = "".join(self.logs)
         self.assertNotIn(GATEWAY_KEY, logs)
+        self.assertNotIn(TENANT_B_KEY, logs)
         self.assertNotIn(PROVIDER_KEY, logs)
+        self.assertNotIn(PROVIDER_KEY_B, logs)
         self.assertNotIn("prompt-never-log", logs)
         self.assertIn('"request_id"', logs)
 
@@ -1099,11 +1777,18 @@ class GatewayIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(completion)
         self.assertEqual(completion["stream"], "true")
         self.assertEqual(completion["provider_result"], "success")
+        self.assertEqual(completion["tenant_slug"], "tenant-a")
+        self.assertEqual(completion["api_key_id"], self.public_key_id(GATEWAY_KEY))
         self.assertEqual(int(completion["response_bytes"]), len(stream_body))
         self.assertIn("backpressure_pauses", completion)
         logs = "".join(self.logs)
         self.assertNotIn("stream-prompt-never-log", logs)
         self.assertNotIn("event-body-never-log", logs)
+        digest = self.database_query(
+            f"SELECT HEX(key_hmac) FROM api_keys WHERE display_prefix='{GATEWAY_KEY[5:17]}'"
+        ).strip()
+        self.assertNotIn(digest, logs)
+        self.assertNotIn(digest.lower(), logs)
 
     def test_failed_stream_log_counts_the_terminal_error_bytes(self):
         self.provider_state.reset("stream_close_after_commit")
@@ -1132,6 +1817,6 @@ class GatewayIntegrationTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        raise SystemExit("usage: test_gateway.py /path/to/AiGateway [unittest filters]")
-    unittest.main(argv=[sys.argv[0], *sys.argv[2:]])
+    if len(sys.argv) < 4:
+        raise SystemExit("usage: test_gateway.py /path/to/AiGateway /path/to/AiGatewayAdmin /repo [filters]")
+    unittest.main(argv=[sys.argv[0], *sys.argv[4:]])

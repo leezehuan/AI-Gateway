@@ -7,6 +7,18 @@ find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h)
 find_library(HIREDIS_LIBRARY NAMES hiredis)
 find_path(MYSQL_INCLUDE_DIR NAMES mysql.h PATH_SUFFIXES mysql mariadb)
 find_library(MYSQL_CLIENT_LIBRARY NAMES mysqlclient mariadb)
+if(MYSQL_CLIENT_LIBRARY MATCHES "\\.a$")
+    find_file(MYSQL_VERSIONED_SHARED_LIBRARY
+        NAMES libmariadb.so.3
+        PATHS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+              /lib/${CMAKE_LIBRARY_ARCHITECTURE}
+              /usr/lib /lib
+        NO_DEFAULT_PATH
+    )
+    if(MYSQL_VERSIONED_SHARED_LIBRARY)
+        set(MYSQL_CLIENT_LIBRARY "${MYSQL_VERSIONED_SHARED_LIBRARY}")
+    endif()
+endif()
 
 foreach(required_var
         MUDUO_INCLUDE_DIR MUDUO_NET_LIBRARY MUDUO_BASE_LIBRARY

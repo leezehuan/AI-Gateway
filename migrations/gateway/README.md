@@ -1,8 +1,16 @@
 # Gateway Schema Migrations
 
 Gateway migrations use monotonically increasing filenames in the form
-`NNNN_description.sql`. They are applied offline and recorded in a future `schema_migrations` table.
+`NNNN_description.sql`. Apply them offline with:
 
-Phase 0/1 deliberately contains no domain migration because the gateway uses static environment
-configuration and does not access MySQL. Tenant, API key, Provider, route, and audit tables start in
-Phase 3; chat tables are never copied into this directory.
+```shell
+build/gateway/bin/AiGatewayAdmin migrate --dir migrations/gateway
+```
+
+Applied versions and SHA-256 checksums are recorded in `schema_migrations`. Reapplying an unchanged
+directory is idempotent; changing an applied file is a checksum error. The Gateway accepts exactly
+the Phase 3 schema version and reports not-ready for an older or newer schema.
+
+`0001_phase3_identity_policy.sql` owns Tenant, API Key, Access Policy, grant, Provider, Endpoint,
+Credential, Logical Model, and Model Mapping data. Chat, conversation, Usage, quota, pricing, and
+request-attempt tables do not belong in this migration context.

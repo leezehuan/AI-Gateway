@@ -1,4 +1,5 @@
 #include "gateway/gateway.hpp"
+#include "gateway/runtime.hpp"
 
 #include "json.hpp"
 
@@ -106,23 +107,10 @@ std::string trim(std::string value)
     return value.substr(offset);
 }
 
-bool constant_time_equal(std::string_view left, std::string_view right)
-{
-    std::size_t difference = left.size() ^ right.size();
-    const std::size_t count = std::max(left.size(), right.size());
-    for (std::size_t index = 0; index < count; ++index)
-    {
-        const unsigned char a = index < left.size() ? left[index] : 0;
-        const unsigned char b = index < right.size() ? right[index] : 0;
-        difference |= a ^ b;
-    }
-    return difference == 0;
-}
-
-bool authorized(const GatewayRequest &request, const std::string &expected)
+bool bearer_token(const GatewayRequest &request, std::string &token)
 {
     const auto found = request.headers.find("authorization");
-    if (found == request.headers.end() || expected.empty())
+    if (found == request.headers.end())
     {
         return false;
     }
@@ -133,7 +121,8 @@ bool authorized(const GatewayRequest &request, const std::string &expected)
     {
         return false;
     }
-    return constant_time_equal(trim(value.substr(separator + 1)), expected);
+    token = trim(value.substr(separator + 1));
+    return !token.empty();
 }
 
 void write_response(ResponseWriter &writer,
@@ -161,7 +150,9 @@ void log_completion(const GatewayRequest &request,
                     const std::string &provider_result = "not_attempted",
                     std::size_t response_bytes = 0,
                     bool stream = false,
-                    std::size_t pauses = 0)
+                    std::size_t pauses = 0,
+                    const std::string &tenant_slug = {},
+                    const std::string &public_api_key_id = {})
 {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
@@ -183,18 +174,26 @@ void log_completion(const GatewayRequest &request,
     {
         fields["logical_model"] = logical_model;
     }
+    if (!tenant_slug.empty())
+    {
+        fields["tenant_slug"] = tenant_slug;
+    }
+    if (!public_api_key_id.empty())
+    {
+        fields["api_key_id"] = public_api_key_id;
+    }
     structured_log("request_completed", fields);
 }
 
 HeaderMap upstream_headers(const GatewayRequest &request,
-                           const GatewayConfig &config,
+                           const ModelTarget &target,
                            bool stream)
 {
     static const char *allowed[] = {
         "user-agent", "openai-beta", "originator", "session-id",
         "thread-id", "x-client-request-id"};
 
-    HeaderMap headers{{"authorization", "Bearer " + config.provider_api_key},
+    HeaderMap headers{{"authorization", "Bearer " + target.provider_api_key},
                       {"content-type", "application/json"},
                       {"accept", stream ? "text/event-stream" : "application/json"},
                       {"x-request-id", request.request_id}};
@@ -515,12 +514,16 @@ public:
                     CancellationToken cancellation,
                     GatewayConfig config,
                     std::string logical_model,
+                    std::string tenant_slug,
+                    std::string public_api_key_id,
                     std::chrono::steady_clock::time_point started)
         : request_(request),
           response_(response),
           cancellation_(std::move(cancellation)),
           config_(std::move(config)),
           logical_model_(std::move(logical_model)),
+          tenant_slug_(std::move(tenant_slug)),
+          public_api_key_id_(std::move(public_api_key_id)),
           started_(started),
           binding_(std::make_shared<TransferBinding>())
     {
@@ -652,9 +655,7 @@ public:
             !response_.client_connected())
         {
             response_.end();
-            log_completion(request_, 499, started_, logical_model_, "client_cancelled",
-                           response_bytes_,
-                           true, pauses_);
+            log(499, "client_cancelled", response_bytes_);
             return;
         }
 
@@ -666,8 +667,7 @@ public:
         if (committed_ && success_terminal_seen_ && local_failure_.empty())
         {
             response_.end();
-            log_completion(request_, 200, started_, logical_model_, "success", response_bytes_,
-                           true, pauses_);
+            log(200, "success", response_bytes_);
             return;
         }
         if (upstream.error != ProviderError::none)
@@ -679,8 +679,7 @@ public:
                                              : local_failure_;
                 write_terminal_error();
                 response_.end();
-                log_completion(request_, 200, started_, logical_model_, code, response_bytes_,
-                               true, pauses_);
+                log(200, code, response_bytes_);
             }
             else
             {
@@ -690,8 +689,7 @@ public:
                 const std::string body = openai_error_body(
                     "Upstream provider request failed", "server_error", code);
                 write_response(response_, 502, request_.request_id, body);
-                log_completion(request_, 502, started_, logical_model_, code, body.size(), true,
-                               pauses_);
+                log(502, code, body.size());
             }
             return;
         }
@@ -710,8 +708,7 @@ public:
             const std::string body = openai_error_body(
                 "Upstream provider rejected the request", "upstream_error", code);
             write_response(response_, client_status, request_.request_id, body, std::move(extra));
-            log_completion(request_, client_status, started_, logical_model_, code, body.size(),
-                           true, pauses_);
+            log(client_status, code, body.size());
             return;
         }
         if (status < 200 || status >= 300)
@@ -720,8 +717,7 @@ public:
                 "Upstream provider returned an invalid status", "server_error",
                 "upstream_unavailable");
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_, "upstream_unavailable",
-                           body.size(), true, pauses_);
+            log(502, "upstream_unavailable", body.size());
             return;
         }
         if (!sse_)
@@ -730,8 +726,7 @@ public:
                 "Upstream provider did not return an event stream", "server_error",
                 "upstream_invalid_stream");
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_, "upstream_invalid_stream",
-                           body.size(), true, pauses_);
+            log(502, "upstream_invalid_stream", body.size());
             return;
         }
 
@@ -741,26 +736,29 @@ public:
                 "Upstream provider returned no valid stream event", "server_error",
                 local_failure_.empty() ? "upstream_invalid_stream" : local_failure_);
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_,
-                           local_failure_.empty() ? "upstream_invalid_stream" : local_failure_,
-                           body.size(), true, pauses_);
+            log(502, local_failure_.empty() ? "upstream_invalid_stream" : local_failure_,
+                body.size());
             return;
         }
         if (!local_failure_.empty())
         {
             write_terminal_error();
             response_.end();
-            log_completion(request_, 200, started_, logical_model_, local_failure_, response_bytes_,
-                           true, pauses_);
+            log(200, local_failure_, response_bytes_);
             return;
         }
         write_terminal_error();
         response_.end();
-        log_completion(request_, 200, started_, logical_model_, "upstream_stream_incomplete",
-                       response_bytes_, true, pauses_);
+        log(200, "upstream_stream_incomplete", response_bytes_);
     }
 
 private:
+    void log(int status, const std::string &provider_result, std::size_t bytes)
+    {
+        log_completion(request_, status, started_, logical_model_, provider_result, bytes, true,
+                       pauses_, tenant_slug_, public_api_key_id_);
+    }
+
     bool commit()
     {
         committed_ = true;
@@ -823,6 +821,8 @@ private:
     CancellationToken cancellation_;
     GatewayConfig config_;
     std::string logical_model_;
+    std::string tenant_slug_;
+    std::string public_api_key_id_;
     std::chrono::steady_clock::time_point started_;
     std::shared_ptr<TransferBinding> binding_;
     SseDecoder decoder_;
@@ -850,11 +850,15 @@ public:
                    ResponseWriter &response,
                    CancellationToken cancellation,
                    std::string logical_model,
+                   std::string tenant_slug,
+                   std::string public_api_key_id,
                    std::chrono::steady_clock::time_point started)
         : request_(request),
           response_(response),
           cancellation_(std::move(cancellation)),
           logical_model_(std::move(logical_model)),
+          tenant_slug_(std::move(tenant_slug)),
+          public_api_key_id_(std::move(public_api_key_id)),
           started_(started),
           binding_(std::make_shared<TransferBinding>())
     {
@@ -880,7 +884,7 @@ public:
         if (cancellation_.is_cancelled() || !response_.client_connected())
         {
             response_.end();
-            log_completion(request_, 499, started_, logical_model_, "client_cancelled");
+            log(499, "client_cancelled");
             return;
         }
         if (upstream.error != ProviderError::none)
@@ -889,7 +893,7 @@ public:
             const std::string body = openai_error_body(
                 "Upstream provider request failed", "server_error", code);
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_, code, body.size());
+            log(502, code, body.size());
             return;
         }
         if (upstream.status >= 400 && upstream.status < 500)
@@ -906,7 +910,7 @@ public:
             const std::string body = openai_error_body(
                 "Upstream provider rejected the request", "upstream_error", code);
             write_response(response_, status, request_.request_id, body, std::move(extra));
-            log_completion(request_, status, started_, logical_model_, code, body.size());
+            log(status, code, body.size());
             return;
         }
         if (upstream.status < 200 || upstream.status >= 300)
@@ -915,8 +919,7 @@ public:
                 "Upstream provider returned an invalid status", "server_error",
                 "upstream_unavailable");
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_, "upstream_unavailable",
-                           body.size());
+            log(502, "upstream_unavailable", body.size());
             return;
         }
         json response_json;
@@ -930,8 +933,7 @@ public:
                 "Upstream provider returned invalid JSON", "server_error",
                 "upstream_invalid_response");
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_, "upstream_invalid_response",
-                           body.size());
+            log(502, "upstream_invalid_response", body.size());
             return;
         }
         if (!response_json.is_object())
@@ -940,8 +942,7 @@ public:
                 "Upstream provider returned an invalid response", "server_error",
                 "upstream_invalid_response");
             write_response(response_, 502, request_.request_id, body);
-            log_completion(request_, 502, started_, logical_model_, "upstream_invalid_response",
-                           body.size());
+            log(502, "upstream_invalid_response", body.size());
             return;
         }
         if (response_json.contains("model"))
@@ -950,15 +951,22 @@ public:
         }
         const std::string body = response_json.dump();
         write_response(response_, static_cast<int>(upstream.status), request_.request_id, body);
-        log_completion(request_, static_cast<int>(upstream.status), started_, logical_model_,
-                       "success", body.size());
+        log(static_cast<int>(upstream.status), "success", body.size());
     }
 
 private:
+    void log(int status, const std::string &provider_result, std::size_t bytes = 0)
+    {
+        log_completion(request_, status, started_, logical_model_, provider_result, bytes, false,
+                       0, tenant_slug_, public_api_key_id_);
+    }
+
     GatewayRequest request_;
     ResponseWriter &response_;
     CancellationToken cancellation_;
     std::string logical_model_;
+    std::string tenant_slug_;
+    std::string public_api_key_id_;
     std::chrono::steady_clock::time_point started_;
     std::shared_ptr<TransferBinding> binding_;
     bool finalized_ = false;
@@ -1006,14 +1014,14 @@ void CancellationSource::cancel() const
     }
 }
 
-AiGateway::AiGateway(GatewayConfig config, ProviderTransport &transport)
-    : config_(std::move(config)), transport_(transport)
+AiGateway::AiGateway(RuntimeState &runtime, ProviderTransport &transport)
+    : runtime_(runtime), transport_(transport)
 {
 }
 
 bool AiGateway::ready() const
 {
-    return config_.ready() && transport_.healthy();
+    return runtime_.ready() && transport_.healthy();
 }
 
 void AiGateway::handle(const GatewayRequest &request,
@@ -1038,15 +1046,8 @@ void AiGateway::handle(const GatewayRequest &request,
         log_completion(request, is_ready ? 200 : 503, started, {}, "not_attempted", body.size());
         return;
     }
-    if (!ready())
-    {
-        const std::string body = openai_error_body(
-            "Gateway is not ready", "server_error", "gateway_not_ready");
-        write_response(response, 503, request.request_id, body);
-        log_completion(request, 503, started, {}, "not_attempted", body.size());
-        return;
-    }
-    if (!authorized(request, config_.api_key))
+    std::string token;
+    if (!bearer_token(request, token))
     {
         const std::string body = openai_error_body(
             "Invalid API key", "authentication_error", "invalid_api_key");
@@ -1055,16 +1056,84 @@ void AiGateway::handle(const GatewayRequest &request,
         log_completion(request, 401, started, {}, "not_attempted", body.size());
         return;
     }
+
+    runtime_.authenticate(
+        std::move(token),
+        [this, request, &response, cancellation, started](AuthResult result) mutable {
+            if (cancellation.is_cancelled() || !response.client_connected())
+            {
+                response.end();
+                log_completion(request, 499, started, {}, "client_cancelled");
+                return;
+            }
+            if (result.status == AuthStatus::invalid_api_key)
+            {
+                const std::string body = openai_error_body(
+                    "Invalid API key", "authentication_error", "invalid_api_key");
+                write_response(response, 401, request.request_id, body,
+                               {{"www-authenticate", "Bearer"}});
+                log_completion(request, 401, started, {}, "not_attempted", body.size());
+                return;
+            }
+            if (result.status == AuthStatus::access_disabled)
+            {
+                const std::string body = openai_error_body(
+                    "Access is disabled", "permission_error", "access_disabled");
+                write_response(response, 403, request.request_id, body);
+                log_completion(request, 403, started, {}, "not_attempted", body.size());
+                return;
+            }
+            if (result.status != AuthStatus::authorized || !result.snapshot)
+            {
+                const std::string body = openai_error_body(
+                    "Gateway authorization is unavailable", "server_error",
+                    "authorization_unavailable");
+                write_response(response, 503, request.request_id, body);
+                log_completion(request, 503, started, {}, "not_attempted", body.size());
+                return;
+            }
+            handle_authorized(request, response, cancellation, started,
+                              std::move(result.snapshot));
+        });
+}
+
+void AiGateway::handle_authorized(GatewayRequest request,
+                                  ResponseWriter &response,
+                                  CancellationToken cancellation,
+                                  std::chrono::steady_clock::time_point started,
+                                  std::shared_ptr<const AuthSnapshot> snapshot)
+{
+    const GatewayConfig &config = runtime_.config();
+    const std::string &tenant_slug = snapshot->tenant_slug;
+    const std::string &api_key_id = snapshot->public_api_key_id;
     if (request.method == "GET" && request.path == "/v1/models")
     {
-        json body_json = { {"object", "list"},
-                           {"data", {{{"id", config_.logical_model},
-                                       {"object", "model"},
-                                       {"created", 0},
-                                       {"owned_by", "ai-gateway"}}}} };
+        std::vector<std::string> model_names;
+        if (snapshot->protocols.count("responses") != 0)
+        {
+            for (const auto &entry : snapshot->models)
+            {
+                const ModelAccess &access = entry.second;
+                if (access.protocol == "responses" && access.model_granted &&
+                    !access.configuration_unavailable && access.active_mapping_count == 1 &&
+                    access.candidates.size() == 1)
+                {
+                    model_names.push_back(access.name);
+                }
+            }
+        }
+        std::sort(model_names.begin(), model_names.end());
+        json data = json::array();
+        for (const auto &name : model_names)
+        {
+            data.push_back({{"id", name}, {"object", "model"}, {"created", 0},
+                            {"owned_by", "ai-gateway"}});
+        }
+        json body_json = {{"object", "list"}, {"data", std::move(data)}};
         const std::string body = body_json.dump();
         write_response(response, 200, request.request_id, body);
-        log_completion(request, 200, started, config_.logical_model, "not_attempted", body.size());
+        log_completion(request, 200, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
         return;
     }
     if (request.method != "POST" || request.path != "/v1/responses")
@@ -1072,15 +1141,26 @@ void AiGateway::handle(const GatewayRequest &request,
         const std::string body = openai_error_body(
             "Endpoint not found", "invalid_request_error", "not_found");
         write_response(response, 404, request.request_id, body);
-        log_completion(request, 404, started, {}, "not_attempted", body.size());
+        log_completion(request, 404, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
         return;
     }
-    if (request.body.size() > config_.max_body_bytes)
+    if (snapshot->protocols.count("responses") == 0)
+    {
+        const std::string body = openai_error_body(
+            "Protocol is not allowed", "permission_error", "protocol_not_allowed");
+        write_response(response, 403, request.request_id, body);
+        log_completion(request, 403, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
+        return;
+    }
+    if (request.body.size() > config.max_body_bytes)
     {
         const std::string body = openai_error_body(
             "Request body is too large", "invalid_request_error", "body_too_large");
         write_response(response, 413, request.request_id, body);
-        log_completion(request, 413, started, {}, "not_attempted", body.size());
+        log_completion(request, 413, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
         return;
     }
     const auto content_type = request.headers.find("content-type");
@@ -1091,7 +1171,8 @@ void AiGateway::handle(const GatewayRequest &request,
             "Content-Type must be application/json", "invalid_request_error",
             "invalid_content_type", "content-type");
         write_response(response, 400, request.request_id, body);
-        log_completion(request, 400, started, {}, "not_attempted", body.size());
+        log_completion(request, 400, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
         return;
     }
     json payload;
@@ -1104,7 +1185,8 @@ void AiGateway::handle(const GatewayRequest &request,
         const std::string body = openai_error_body(
             "Request body must be valid JSON", "invalid_request_error", "invalid_json");
         write_response(response, 400, request.request_id, body);
-        log_completion(request, 400, started, {}, "not_attempted", body.size());
+        log_completion(request, 400, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
         return;
     }
     if (!payload.is_object() || !payload.contains("model") || !payload["model"].is_string() ||
@@ -1113,16 +1195,30 @@ void AiGateway::handle(const GatewayRequest &request,
         const std::string body = openai_error_body(
             "model must be a non-empty string", "invalid_request_error", "invalid_model", "model");
         write_response(response, 400, request.request_id, body);
-        log_completion(request, 400, started, {}, "not_attempted", body.size());
+        log_completion(request, 400, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
         return;
     }
     const std::string logical_model = payload["model"].get<std::string>();
-    if (!constant_time_equal(logical_model, config_.logical_model))
+    const auto model = snapshot->models.find("responses\x1f" + logical_model);
+    if (model == snapshot->models.end() || !model->second.model_granted ||
+        (model->second.provider_denied && model->second.candidates.empty()))
     {
         const std::string body = openai_error_body(
             "Model is not allowed", "permission_error", "model_not_allowed", "model");
         write_response(response, 403, request.request_id, body);
-        log_completion(request, 403, started, {}, "not_attempted", body.size());
+        log_completion(request, 403, started, {}, "not_attempted", body.size(), false, 0,
+                       tenant_slug, api_key_id);
+        return;
+    }
+    if (model->second.configuration_unavailable || model->second.active_mapping_count != 1 ||
+        model->second.candidates.size() != 1)
+    {
+        const std::string body = openai_error_body(
+            "Model is temporarily unavailable", "server_error", "model_unavailable", "model");
+        write_response(response, 503, request.request_id, body);
+        log_completion(request, 503, started, logical_model, "not_attempted", body.size(), false,
+                       0, tenant_slug, api_key_id);
         return;
     }
     if (payload.contains("stream") && !payload["stream"].is_boolean())
@@ -1130,26 +1226,29 @@ void AiGateway::handle(const GatewayRequest &request,
         const std::string body = openai_error_body(
             "stream must be a boolean", "invalid_request_error", "invalid_stream", "stream");
         write_response(response, 400, request.request_id, body);
-        log_completion(request, 400, started, logical_model, "not_attempted", body.size());
+        log_completion(request, 400, started, logical_model, "not_attempted", body.size(), false,
+                       0, tenant_slug, api_key_id);
         return;
     }
 
     const bool stream = payload.value("stream", false);
-    payload["model"] = config_.upstream_model;
+    const ModelTarget &target = model->second.candidates.front();
+    payload["model"] = target.upstream_model;
     ProviderRequest provider_request;
-    provider_request.url = config_.provider_responses_url;
-    provider_request.headers = upstream_headers(request, config_, stream);
+    provider_request.url = target.provider_url;
+    provider_request.headers = upstream_headers(request, target, stream);
     provider_request.body = payload.dump();
-    provider_request.max_response_bytes = config_.max_response_bytes;
-    provider_request.timeout_ms = config_.upstream_timeout_ms;
+    provider_request.max_response_bytes = config.max_response_bytes;
+    provider_request.timeout_ms = config.upstream_timeout_ms;
     provider_request.streaming = stream;
-    provider_request.idle_timeout_ms = config_.stream_idle_timeout_ms;
-    provider_request.max_duration_ms = config_.stream_max_duration_ms;
+    provider_request.idle_timeout_ms = config.stream_idle_timeout_ms;
+    provider_request.max_duration_ms = config.stream_max_duration_ms;
 
     if (stream)
     {
         auto state = std::make_shared<StreamExecution>(
-            request, response, cancellation, config_, logical_model, started);
+            request, response, cancellation, config, logical_model, tenant_slug, api_key_id,
+            started);
         response.set_writable_callback([weak = std::weak_ptr<StreamExecution>(state)] {
             if (auto locked = weak.lock())
             {
@@ -1171,7 +1270,7 @@ void AiGateway::handle(const GatewayRequest &request,
     }
 
     auto state = std::make_shared<BasicExecution>(
-        request, response, cancellation, logical_model, started);
+        request, response, cancellation, logical_model, tenant_slug, api_key_id, started);
     cancellation.on_cancel([weak = std::weak_ptr<BasicExecution>(state)] {
         if (auto locked = weak.lock())
         {

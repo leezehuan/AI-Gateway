@@ -1,27 +1,49 @@
 # Cluster-Chat-Server
 
-> Migration status: Phase 0 through Phase 2 add an independent C++ AI API gateway while the legacy
+> Migration status: Phase 0 through Phase 3 add an independent C++ AI API gateway while the legacy
 > chat server remains available as a rollback target. See
 > [`ai-api-gateway-migration-spec.md`](ai-api-gateway-migration-spec.md).
 
-## AI Gateway (Phase 2)
+## AI Gateway (Phase 3)
 
 `AiGateway` exposes `GET /healthz`, `GET /readyz`, `GET /v1/models`, and streaming or non-streaming
 `POST /v1/responses`. It uses asynchronous Boost.Beast/Asio for ingress and one process-wide
 libcurl multi transport for upstream requests. SSE responses are incrementally validated and
 relayed with bounded buffering, high/low-water backpressure, upstream cancellation on client
-disconnect, and separate first-event, idle, and maximum-duration timeouts. Distributed quotas,
-multi-tenant MySQL configuration, retries, Provider routing, and failover remain out of scope.
+disconnect, and separate first-event, idle, and maximum-duration timeouts.
 
-Configure the `AI_GATEWAY_*` values in `.env`, then build and run:
+Phase 3 stores Tenant identity, HMAC-only API Keys, reusable Access Policies, Provider resources,
+and Tenant-scoped Logical Models in MySQL. Blocking SQL is isolated on a fixed worker pool. A
+configuration-version poll invalidates cached Auth Snapshots; database or schema failures make
+`/readyz` and new authorization fail closed while `/healthz` remains available. Provider secrets
+are resolved from `env:NAME` or a non-symlink `file:basename` below `AI_GATEWAY_SECRET_DIR`; plaintext
+Gateway or Provider keys are never stored in MySQL. Redis quotas, Usage, retries, routing, and
+failover remain out of scope.
+
+Configure the Gateway DB and HMAC pepper values in `.env`, then build:
 
 ```shell
 cmake -S . -B build/gateway \
   -DBUILD_CHAT_SERVER=OFF \
   -DBUILD_CHAT_CLIENT=OFF
 cmake --build build/gateway
+```
+
+Create the database schema, import resources, and issue a Tenant Key. The complete Key is printed
+to stdout only for that issuance command:
+
+```shell
+build/gateway/bin/AiGatewayAdmin migrate --dir migrations/gateway
+build/gateway/bin/AiGatewayAdmin apply-config --file config/ai-gateway.example.json
+AI_GATEWAY_API_KEY="$(build/gateway/bin/AiGatewayAdmin issue-key \
+  --tenant example --policy default --name local-client)"
 BUILD_DIR=build/gateway ./scripts/run-gateway.sh
 ```
+
+Use `AiGatewayAdmin set-key-status --key-id <public-id> --status disabled` to revoke a Key, and
+`AiGatewayAdmin bump-version` after rotating a `file:` Secret. Environment Secret rotation requires
+a Gateway restart. `apply-config` upserts supplied resources without deleting omitted resources;
+an effective change increments the configuration version once.
 
 Example non-streaming request:
 
@@ -41,6 +63,17 @@ curl -N http://127.0.0.1:8080/v1/responses \
   -d '{"model":"your-logical-model","input":"hello","stream":true}'
 ```
 
+The runtime identity controls use these defaults:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `AI_GATEWAY_DB_POOL_SIZE` | `4` | Maximum concurrent Gateway DB connections |
+| `AI_GATEWAY_DB_WORKERS` | `4` | Fixed blocking SQL worker count |
+| `AI_GATEWAY_DB_QUEUE_SIZE` | `1024` | Maximum queued DB operations |
+| `AI_GATEWAY_AUTH_CACHE_TTL_SECONDS` | `30` | Auth Snapshot cache lifetime |
+| `AI_GATEWAY_AUTH_CACHE_MAX_ENTRIES` | `10000` | Auth Snapshot LRU capacity |
+| `AI_GATEWAY_CONFIG_POLL_INTERVAL_MS` | `1000` | Configuration-version poll interval |
+
 The stream controls use these defaults:
 
 | Variable | Default | Meaning |
@@ -55,14 +88,14 @@ The low watermark must be below the high watermark, and prefetch must not exceed
 watermark. The Nginx HTTP/1.1 reverse-proxy example for SSE is
 [`deploy/nginx/ai-gateway.conf.example`](deploy/nginx/ai-gateway.conf.example).
 
-Run the localhost integration test with:
+Run the localhost integration tests, which start a temporary MariaDB and Mock Provider, with:
 
 ```shell
 ctest --test-dir build/gateway --output-on-failure
 ```
 
 The captured Codex client requests `stream=true`; its request and event contract is covered by the
-Phase 2 localhost Provider fixture. Architectural decisions and the captured contract are in
+localhost Provider fixture. Architectural decisions and the captured contract are in
 `docs/adr/` and `docs/compatibility/`.
 
 在 Linux 环境下基于 muduo 开发的集群聊天服务器。实现新用户注册、用户登录、添加好友、添加群组、好友通信、群组聊天、保持离线消息等功能。
@@ -95,7 +128,9 @@ Redis、hiredis、Boost 和 libcurl；Nginx 只在学习多服务器负载均衡
 
 脚本会安装 Ubuntu 依赖、启动 MariaDB/Redis、创建本地数据库账号、导入
 `chat.sql`，最后编译项目。首次运行前必须通过环境变量或 `.env` 设置
-`CHAT_DB_PASSWORD`；脚本不会再创建固定的教学密码，也不会修改数据库 root 密码。
+`CHAT_DB_PASSWORD` 和 `AI_GATEWAY_DB_PASSWORD`（交互终端也可分别输入）；脚本不会创建
+固定的教学密码，也不会修改数据库 root 密码。运行 Gateway 前还必须设置至少 32 字节的
+`AI_GATEWAY_API_KEY_HMAC_PEPPER`。
 若脚本提示找不到 Muduo，请先按课程步骤安装 Muduo，并确认存在：
 
 ```text

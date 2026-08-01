@@ -2,6 +2,7 @@
 #define AI_GATEWAY_GATEWAY_HPP
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -12,8 +13,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gateway/mysql.hpp"
+
 namespace ai_gateway
 {
+class RuntimeState;
+struct AuthSnapshot;
 using HeaderMap = std::unordered_map<std::string, std::string>;
 
 struct GatewayRequest
@@ -69,11 +74,15 @@ struct GatewayConfig
 {
     std::string listen_address = "127.0.0.1";
     std::uint16_t listen_port = 8080;
-    std::string api_key;
-    std::string provider_responses_url;
-    std::string provider_api_key;
-    std::string logical_model;
-    std::string upstream_model;
+    DatabaseConfig database;
+    std::string api_key_hmac_pepper;
+    std::string secret_dir = "/run/secrets/ai-gateway";
+    std::size_t database_pool_size = 4;
+    std::size_t database_workers = 4;
+    std::size_t database_queue_size = 1024;
+    std::size_t auth_cache_ttl_seconds = 30;
+    std::size_t auth_cache_max_entries = 10000;
+    long config_poll_interval_ms = 1000;
     std::size_t max_body_bytes = 1024 * 1024;
     std::size_t max_response_bytes = 16 * 1024 * 1024;
     long upstream_timeout_ms = 30000;
@@ -85,7 +94,7 @@ struct GatewayConfig
     std::size_t io_threads = 2;
 
     static GatewayConfig from_env();
-    bool ready() const;
+    void validate() const;
 };
 
 struct ProviderRequest
@@ -160,7 +169,7 @@ public:
 class AiGateway
 {
 public:
-    AiGateway(GatewayConfig config, ProviderTransport &transport);
+    AiGateway(RuntimeState &runtime, ProviderTransport &transport);
 
     void handle(const GatewayRequest &request,
                 ResponseWriter &response,
@@ -168,7 +177,13 @@ public:
     bool ready() const;
 
 private:
-    GatewayConfig config_;
+    void handle_authorized(GatewayRequest request,
+                           ResponseWriter &response,
+                           CancellationToken cancellation,
+                           std::chrono::steady_clock::time_point started,
+                           std::shared_ptr<const AuthSnapshot> snapshot);
+
+    RuntimeState &runtime_;
     ProviderTransport &transport_;
 };
 

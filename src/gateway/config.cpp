@@ -39,10 +39,6 @@ T env_number(const char *name, T fallback, T minimum, T maximum)
     return static_cast<T>(parsed);
 }
 
-bool supported_url(const std::string &url)
-{
-    return url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0;
-}
 } // namespace
 
 GatewayConfig GatewayConfig::from_env()
@@ -51,11 +47,28 @@ GatewayConfig GatewayConfig::from_env()
     config.listen_address = env_string("AI_GATEWAY_LISTEN_ADDRESS", "127.0.0.1");
     config.listen_port = env_number<std::uint16_t>(
         "AI_GATEWAY_LISTEN_PORT", 8080, 1, std::numeric_limits<std::uint16_t>::max());
-    config.api_key = env_string("AI_GATEWAY_API_KEY");
-    config.provider_responses_url = env_string("AI_GATEWAY_PROVIDER_RESPONSES_URL");
-    config.provider_api_key = env_string("AI_GATEWAY_PROVIDER_API_KEY");
-    config.logical_model = env_string("AI_GATEWAY_LOGICAL_MODEL");
-    config.upstream_model = env_string("AI_GATEWAY_UPSTREAM_MODEL");
+    config.database.host = env_string("AI_GATEWAY_DB_HOST", "127.0.0.1");
+    config.database.port = env_number<std::uint16_t>(
+        "AI_GATEWAY_DB_PORT", 3306, 1, std::numeric_limits<std::uint16_t>::max());
+    config.database.user = env_string("AI_GATEWAY_DB_USER", "ai_gateway");
+    config.database.password = env_string("AI_GATEWAY_DB_PASSWORD");
+    config.database.name = env_string("AI_GATEWAY_DB_NAME", "ai_gateway");
+    config.database.connect_timeout_seconds = env_number<unsigned>(
+        "AI_GATEWAY_DB_CONNECT_TIMEOUT_SECONDS", 2, 1, 30);
+    config.api_key_hmac_pepper = env_string("AI_GATEWAY_API_KEY_HMAC_PEPPER");
+    config.secret_dir = env_string("AI_GATEWAY_SECRET_DIR", "/run/secrets/ai-gateway");
+    config.database_pool_size = env_number<std::size_t>(
+        "AI_GATEWAY_DB_POOL_SIZE", 4, 1, 64);
+    config.database_workers = env_number<std::size_t>(
+        "AI_GATEWAY_DB_WORKERS", 4, 1, 64);
+    config.database_queue_size = env_number<std::size_t>(
+        "AI_GATEWAY_DB_QUEUE_SIZE", 1024, 1, 100000);
+    config.auth_cache_ttl_seconds = env_number<std::size_t>(
+        "AI_GATEWAY_AUTH_CACHE_TTL_SECONDS", 30, 1, 3600);
+    config.auth_cache_max_entries = env_number<std::size_t>(
+        "AI_GATEWAY_AUTH_CACHE_MAX_ENTRIES", 10000, 1, 1000000);
+    config.config_poll_interval_ms = env_number<long>(
+        "AI_GATEWAY_CONFIG_POLL_INTERVAL_MS", 1000, 100, 60000);
     config.max_body_bytes = env_number<std::size_t>(
         "AI_GATEWAY_MAX_BODY_BYTES", 1024 * 1024, 1024, 64 * 1024 * 1024);
     config.max_response_bytes = env_number<std::size_t>(
@@ -89,9 +102,16 @@ GatewayConfig GatewayConfig::from_env()
     return config;
 }
 
-bool GatewayConfig::ready() const
+void GatewayConfig::validate() const
 {
-    return !api_key.empty() && !provider_api_key.empty() && !logical_model.empty() &&
-           !upstream_model.empty() && supported_url(provider_responses_url);
+    if (database.host.empty() || database.user.empty() || database.name.empty() ||
+        database.password.empty())
+    {
+        throw std::runtime_error("Gateway database configuration is incomplete");
+    }
+    if (api_key_hmac_pepper.size() < 32)
+    {
+        throw std::runtime_error("AI_GATEWAY_API_KEY_HMAC_PEPPER must contain at least 32 bytes");
+    }
 }
 } // namespace ai_gateway
