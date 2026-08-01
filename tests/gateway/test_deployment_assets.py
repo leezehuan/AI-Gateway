@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+import unittest
+
+
+DISCOVERED_LINGSUAN_MODELS = {
+    "codex-auto-review",
+    "gpt-4o-audio-preview",
+    "gpt-4o-realtime-preview",
+    "gpt-5.2",
+    "gpt-5.2-2025-12-11",
+    "gpt-5.2-chat-latest",
+    "gpt-5.2-pro",
+    "gpt-5.2-pro-2025-12-11",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+    "gpt-5.4-2026-03-05",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gpt-5.6",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-image-1",
+    "gpt-image-1.5",
+    "gpt-image-2",
+}
+
+
+class DeploymentAssetsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = pathlib.Path(sys.argv[1])
+        path = cls.repo / "config" / "ai-gateway.lingsuan.json"
+        cls.raw_config = path.read_text(encoding="utf-8")
+        cls.config = json.loads(cls.raw_config)
+        cls.live_test = (
+            cls.repo / "scripts" / "test-lingsuan-nginx.py"
+        ).read_text(encoding="utf-8")
+
+    def test_lingsuan_provider_uses_responses_endpoint_and_environment_secret(self):
+        provider = self.config["providers"][0]
+        self.assertEqual(provider["slug"], "lingsuan")
+        self.assertEqual(
+            provider["endpoints"][0]["url"],
+            "https://lingsuan.top/v1/responses",
+        )
+        self.assertEqual(
+            provider["credentials"][0]["secret_ref"],
+            "env:LINGSUAN_API_KEY",
+        )
+        self.assertNotIn("sk-", self.raw_config)
+
+    def test_lingsuan_models_match_upstream_discovery(self):
+        logical_models = {item["name"] for item in self.config["logical_models"]}
+        policy_models = set(self.config["policies"][0]["models"])
+        mapped_models = {item["logical_model"] for item in self.config["mappings"]}
+        upstream_models = {item["upstream_model"] for item in self.config["mappings"]}
+        self.assertEqual(logical_models, DISCOVERED_LINGSUAN_MODELS)
+        self.assertEqual(policy_models, DISCOVERED_LINGSUAN_MODELS)
+        self.assertEqual(mapped_models, DISCOVERED_LINGSUAN_MODELS)
+        self.assertEqual(upstream_models, DISCOVERED_LINGSUAN_MODELS)
+        self.assertIn("gpt-5.4-mini", logical_models)
+
+    def test_live_nginx_check_defaults_to_gpt_5_4_mini(self):
+        self.assertIn('DEFAULT_MODEL = "gpt-5.4-mini"', self.live_test)
+
+
+if __name__ == "__main__":
+    unittest.main(argv=[sys.argv[0]])

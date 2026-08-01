@@ -81,4 +81,11 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
                 ${PROJECT_SOURCE_DIR}
     )
     set_tests_properties(ai_gateway.admin.integration PROPERTIES TIMEOUT 60)
+
+    add_test(
+        NAME ai_gateway.deployment_assets
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/gateway/test_deployment_assets.py
+                ${PROJECT_SOURCE_DIR}
+    )
 endif()

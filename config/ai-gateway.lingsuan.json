@@ -1,0 +1,104 @@
+{
+  "tenants": [
+    {"slug": "lingsuan", "name": "Lingsuan", "status": "active"}
+  ],
+  "providers": [
+    {
+      "tenant": "lingsuan",
+      "slug": "lingsuan",
+      "name": "Lingsuan",
+      "status": "active",
+      "endpoints": [
+        {
+          "name": "responses",
+          "protocol": "responses",
+          "url": "https://lingsuan.top/v1/responses",
+          "status": "active"
+        }
+      ],
+      "credentials": [
+        {
+          "name": "default",
+          "secret_ref": "env:LINGSUAN_API_KEY",
+          "status": "active"
+        }
+      ]
+    }
+  ],
+  "logical_models": [
+    {"tenant": "lingsuan", "protocol": "responses", "name": "codex-auto-review", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-4o-audio-preview", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-4o-realtime-preview", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.2", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.2-2025-12-11", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.2-chat-latest", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.2-pro", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.2-pro-2025-12-11", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.3-codex-spark", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.4", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.4-2026-03-05", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.4-mini", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.5", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.6", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.6-luna", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.6-sol", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-5.6-terra", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-image-1", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-image-1.5", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "name": "gpt-image-2", "status": "active"}
+  ],
+  "policies": [
+    {
+      "tenant": "lingsuan",
+      "slug": "default",
+      "name": "Default",
+      "status": "active",
+      "protocols": ["responses"],
+      "models": [
+        "codex-auto-review",
+        "gpt-4o-audio-preview",
+        "gpt-4o-realtime-preview",
+        "gpt-5.2",
+        "gpt-5.2-2025-12-11",
+        "gpt-5.2-chat-latest",
+        "gpt-5.2-pro",
+        "gpt-5.2-pro-2025-12-11",
+        "gpt-5.3-codex-spark",
+        "gpt-5.4",
+        "gpt-5.4-2026-03-05",
+        "gpt-5.4-mini",
+        "gpt-5.5",
+        "gpt-5.6",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-image-1",
+        "gpt-image-1.5",
+        "gpt-image-2"
+      ],
+      "providers": ["lingsuan"]
+    }
+  ],
+  "mappings": [
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "codex-auto-review", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "codex-auto-review", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-4o-audio-preview", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-4o-audio-preview", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-4o-realtime-preview", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-4o-realtime-preview", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.2", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.2", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.2-2025-12-11", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.2-2025-12-11", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.2-chat-latest", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.2-chat-latest", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.2-pro", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.2-pro", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.2-pro-2025-12-11", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.2-pro-2025-12-11", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.3-codex-spark", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.3-codex-spark", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.4", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.4", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.4-2026-03-05", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.4-2026-03-05", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.4-mini", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.4-mini", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.5", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.5", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.6", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.6", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.6-luna", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.6-luna", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.6-sol", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.6-sol", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-5.6-terra", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-5.6-terra", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-image-1", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-image-1", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-image-1.5", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-image-1.5", "status": "active"},
+    {"tenant": "lingsuan", "protocol": "responses", "logical_model": "gpt-image-2", "name": "primary", "provider": "lingsuan", "endpoint": "responses", "credential": "default", "upstream_model": "gpt-image-2", "status": "active"}
+  ]
+}

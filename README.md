@@ -98,6 +98,33 @@ The captured Codex client requests `stream=true`; its request and event contract
 localhost Provider fixture. Architectural decisions and the captured contract are in
 `docs/adr/` and `docs/compatibility/`.
 
+### Lingsuan Provider
+
+[`config/ai-gateway.lingsuan.json`](config/ai-gateway.lingsuan.json) contains the models returned
+by `GET https://lingsuan.top/v1/models` on 2026-08-01. It stores only the
+`env:LINGSUAN_API_KEY` Secret reference and maps the logical model names to
+`https://lingsuan.top/v1/responses`. Refresh and review the list before applying it when the
+upstream catalog changes. The Provider model catalog does not itself guarantee that every listed
+model accepts the Responses protocol; validate models used by production policies.
+
+Apply the configuration and issue a Tenant Key with the existing Gateway DB environment loaded:
+
+```shell
+build/gateway/bin/AiGatewayAdmin apply-config --file config/ai-gateway.lingsuan.json
+AI_GATEWAY_API_KEY="$(build/gateway/bin/AiGatewayAdmin issue-key \
+  --tenant lingsuan --policy default --name local-client)"
+```
+
+After starting `AiGateway` with `LINGSUAN_API_KEY` and Nginx with the provided HTTP proxy example,
+run the explicit live check below. It makes billable non-streaming and streaming requests through
+Nginx; `gpt-5.4-mini` is the default and can be overridden with
+`AI_GATEWAY_LIVE_TEST_MODEL`.
+
+```shell
+AI_GATEWAY_API_KEY="${AI_GATEWAY_API_KEY}" \
+  python3 scripts/test-lingsuan-nginx.py
+```
+
 在 Linux 环境下基于 muduo 开发的集群聊天服务器。实现新用户注册、用户登录、添加好友、添加群组、好友通信、群组聊天、保持离线消息等功能。
 
 ## 项目特点

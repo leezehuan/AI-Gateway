@@ -2,6 +2,7 @@
 import http.client
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -1414,6 +1415,94 @@ class GatewayIntegrationTest(unittest.TestCase):
         self.assertEqual(provider_request["headers"]["x-client-request-id"], "stream-client-123")
         self.assertNotIn("x-codex-turn-metadata", provider_request["headers"])
         self.assertNotIn("proxy-authorization", provider_request["headers"])
+
+    @unittest.skipUnless(shutil.which("nginx"), "nginx is not installed")
+    def test_nginx_example_passes_config_test_and_does_not_buffer_sse(self):
+        self.provider_state.reset("stream_success")
+        nginx_port = free_port()
+        nginx_dir = os.path.join(self.database_temp.name, "nginx")
+        os.makedirs(nginx_dir, exist_ok=True)
+        example_path = os.path.join(
+            self.repo, "deploy", "nginx", "ai-gateway.conf.example"
+        )
+        with open(example_path, encoding="utf-8") as source:
+            site = source.read()
+        self.assertIn("proxy_buffering off;", site)
+        self.assertIn("proxy_request_buffering off;", site)
+        site = site.replace(
+            "server 127.0.0.1:8080;",
+            f"server 127.0.0.1:{self.gateway_port};",
+        ).replace("listen 8081;", f"listen {nginx_port};")
+        config_path = os.path.join(nginx_dir, "nginx.conf")
+        with open(config_path, "w", encoding="utf-8") as output:
+            output.write(
+                "worker_processes 1;\n"
+                f"pid {nginx_dir}/nginx.pid;\n"
+                f"error_log {nginx_dir}/error.log notice;\n"
+                "events { worker_connections 64; }\n"
+                "http {\n"
+                "access_log off;\n"
+                f"{site}\n"
+                "}\n"
+            )
+
+        config_test = subprocess.run(
+            ["nginx", "-t", "-p", nginx_dir, "-c", config_path],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        self.assertEqual(config_test.returncode, 0, config_test.stdout)
+        nginx = subprocess.Popen(
+            ["nginx", "-p", nginx_dir, "-c", config_path, "-g", "daemon off;"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    probe = http.client.HTTPConnection("127.0.0.1", nginx_port, timeout=0.5)
+                    probe.request("GET", "/healthz")
+                    ready = probe.getresponse()
+                    ready.read()
+                    probe.close()
+                    if ready.status == 200:
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                self.fail("nginx did not become ready")
+
+            connection = http.client.HTTPConnection("127.0.0.1", nginx_port, timeout=3)
+            connection.request(
+                "POST",
+                "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "hello", "stream": True}),
+                {
+                    "Authorization": f"Bearer {GATEWAY_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.getheader("Content-Type").startswith("text/event-stream"))
+            started = time.time()
+            first_event = response.readline() + response.readline() + response.readline()
+            self.assertLess(time.time() - started, 0.25)
+            self.assertIn(b"event: response.created", first_event)
+            self.assertFalse(self.provider_state.stream_finished.is_set())
+            remaining = response.read()
+            self.assertTrue((first_event + remaining).endswith(b"data: [DONE]\n\n"))
+            connection.close()
+        finally:
+            nginx.terminate()
+            try:
+                nginx.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                nginx.kill()
+                nginx.wait(timeout=5)
 
     def test_streaming_accepts_crlf_split_across_chunks_comments_and_multiline_data(self):
         self.provider_state.reset("stream_split_crlf")
