@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import importlib.util
 import json
 import pathlib
 import sys
@@ -39,6 +40,12 @@ class DeploymentAssetsTest(unittest.TestCase):
         cls.live_test = (
             cls.repo / "scripts" / "test-lingsuan-nginx.py"
         ).read_text(encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "lingsuan_live_test",
+            cls.repo / "scripts" / "test-lingsuan-nginx.py",
+        )
+        cls.live_test_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.live_test_module)
 
     def test_lingsuan_provider_uses_responses_endpoint_and_environment_secret(self):
         provider = self.config["providers"][0]
@@ -64,8 +71,16 @@ class DeploymentAssetsTest(unittest.TestCase):
         self.assertEqual(upstream_models, DISCOVERED_LINGSUAN_MODELS)
         self.assertIn("gpt-5.4-mini", logical_models)
 
-    def test_live_nginx_check_defaults_to_gpt_5_4_mini(self):
-        self.assertIn('DEFAULT_MODEL = "gpt-5.4-mini"', self.live_test)
+    def test_live_nginx_check_defaults_to_configured_responses_model(self):
+        self.assertIn('DEFAULT_MODEL = "gpt-5.6-terra"', self.live_test)
+
+    def test_live_nginx_check_recognizes_data_only_completed_event(self):
+        self.assertEqual(
+            self.live_test_module.classify_sse_line(
+                b'data: {"type":"response.completed","sequence_number":5}\n'
+            ),
+            ("response.completed", True, False),
+        )
 
 
 if __name__ == "__main__":

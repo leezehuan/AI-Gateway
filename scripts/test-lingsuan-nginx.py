@@ -9,7 +9,7 @@ import time
 import urllib.parse
 
 
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-5.6-terra"
 
 
 def fail(message):
@@ -55,6 +55,32 @@ def require_json_success(name, status, body):
     return parsed
 
 
+def classify_sse_line(line):
+    stripped = line.rstrip(b"\r\n")
+    if stripped.startswith(b"event:"):
+        value = stripped[len(b"event:"):]
+        if value.startswith(b" "):
+            value = value[1:]
+        event_type = value.decode("utf-8", "replace")
+        return event_type, event_type == "response.completed", False
+    if not stripped.startswith(b"data:"):
+        return None, False, False
+
+    data = stripped[len(b"data:"):]
+    if data.startswith(b" "):
+        data = data[1:]
+    if data == b"[DONE]":
+        return "[DONE]", False, True
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return None, False, False
+    event_type = payload.get("type") if isinstance(payload, dict) else None
+    if not isinstance(event_type, str):
+        return None, False, False
+    return event_type, event_type == "response.completed", False
+
+
 def check_stream(base_url, api_key, model):
     connection, prefix = connection_for(base_url)
     payload = json.dumps(
@@ -87,26 +113,29 @@ def check_stream(base_url, api_key, model):
     started = time.monotonic()
     first_event_seconds = None
     event_names = []
+    saw_completed = False
     saw_done = False
     while True:
         line = response.readline()
         if not line:
             break
-        if first_event_seconds is None and (line.startswith(b"event:") or line.startswith(b"data:")):
+        event_type, completed, done = classify_sse_line(line)
+        if first_event_seconds is None and event_type is not None:
             first_event_seconds = time.monotonic() - started
-        if line.startswith(b"event:"):
-            event_names.append(line[6:].decode("utf-8", "replace").strip())
-        if line.strip() == b"data: [DONE]":
-            saw_done = True
+        if event_type not in {None, "[DONE]"}:
+            if not event_names or event_names[-1] != event_type:
+                event_names.append(event_type)
+        saw_completed = saw_completed or completed
+        saw_done = saw_done or done
     total_seconds = time.monotonic() - started
     connection.close()
     if first_event_seconds is None:
         fail("streaming response contained no SSE event")
-    if "response.completed" not in event_names or not saw_done:
-        fail("streaming response did not contain response.completed and [DONE]")
+    if not saw_completed and not saw_done:
+        fail("streaming response did not contain a successful terminal event")
     if first_event_seconds >= total_seconds:
         fail("Nginx buffered the complete SSE response before exposing the first event")
-    return event_names, first_event_seconds, total_seconds
+    return event_names, saw_completed, saw_done, first_event_seconds, total_seconds
 
 
 def main():
@@ -138,7 +167,9 @@ def main():
         },
     )
     require_json_success("non-streaming response", response_status, response_body)
-    events, first_event_seconds, total_seconds = check_stream(base_url, api_key, model)
+    events, saw_completed, saw_done, first_event_seconds, total_seconds = check_stream(
+        base_url, api_key, model
+    )
     print(
         json.dumps(
             {
@@ -150,6 +181,8 @@ def main():
                 "streaming_status": 200,
                 "first_event_ms": round(first_event_seconds * 1000),
                 "stream_total_ms": round(total_seconds * 1000),
+                "response_completed": saw_completed,
+                "done_sentinel": saw_done,
                 "events": events,
             },
             separators=(",", ":"),

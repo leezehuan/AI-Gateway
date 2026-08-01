@@ -105,7 +105,9 @@ by `GET https://lingsuan.top/v1/models` on 2026-08-01. It stores only the
 `env:LINGSUAN_API_KEY` Secret reference and maps the logical model names to
 `https://lingsuan.top/v1/responses`. Refresh and review the list before applying it when the
 upstream catalog changes. The Provider model catalog does not itself guarantee that every listed
-model accepts the Responses protocol; validate models used by production policies.
+model accepts the Responses protocol; validate models used by production policies. Lingsuan
+currently terminates successful streams with `response.completed` and no `[DONE]` sentinel; the
+Gateway accepts and forwards that valid terminal form.
 
 Apply the configuration and issue a Tenant Key with the existing Gateway DB environment loaded:
 
@@ -117,7 +119,7 @@ AI_GATEWAY_API_KEY="$(build/gateway/bin/AiGatewayAdmin issue-key \
 
 After starting `AiGateway` with `LINGSUAN_API_KEY` and Nginx with the provided HTTP proxy example,
 run the explicit live check below. It makes billable non-streaming and streaming requests through
-Nginx; `gpt-5.4-mini` is the default and can be overridden with
+Nginx; `gpt-5.6-terra` is the default and can be overridden with
 `AI_GATEWAY_LIVE_TEST_MODEL`.
 
 ```shell
