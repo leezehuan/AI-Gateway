@@ -22,7 +22,13 @@
     }
   ],
   "logical_models": [
-    {"tenant": "example", "protocol": "responses", "name": "codex", "status": "active"}
+    {
+      "tenant": "example",
+      "protocol": "responses",
+      "name": "codex",
+      "status": "active",
+      "routing": {"mode": "fixed_order", "max_attempts": 3}
+    }
   ],
   "policies": [
     {
@@ -45,6 +51,7 @@
       "endpoint": "responses",
       "credential": "default",
       "upstream_model": "gpt-5.2-codex",
+      "priority": 100,
       "status": "active"
     }
   ]

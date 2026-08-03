@@ -2,3 +2,5 @@
 build/*
 !build/compile.md
 /Aether/
+__pycache__/
+*.pyc

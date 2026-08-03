@@ -21,26 +21,34 @@ if(MARIADB_LIBRARY MATCHES "\\.a$")
         set(MARIADB_LIBRARY "${MARIADB_VERSIONED_SHARED_LIBRARY}")
     endif()
 endif()
+find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+find_library(HIREDIS_LIBRARY NAMES hiredis)
+if(NOT HIREDIS_INCLUDE_DIR OR NOT HIREDIS_LIBRARY)
+    message(FATAL_ERROR "hiredis development files are required for AiGateway Phase 4")
+endif()
 if(NOT MARIADB_INCLUDE_DIR OR NOT MARIADB_LIBRARY)
-    message(FATAL_ERROR "MariaDB Connector/C development files are required for AiGateway Phase 3")
+    message(FATAL_ERROR "MariaDB Connector/C development files are required for AiGateway")
 endif()
 
-add_library(ai_gateway_phase3 STATIC
+add_library(ai_gateway_runtime STATIC
     config.cpp
     mysql.cpp
     repository.cpp
     runtime.cpp
+    routing.cpp
 )
-target_include_directories(ai_gateway_phase3 PUBLIC
+target_include_directories(ai_gateway_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${MARIADB_INCLUDE_DIR}
+    ${HIREDIS_INCLUDE_DIR}
 )
-target_link_libraries(ai_gateway_phase3 PUBLIC
+target_link_libraries(ai_gateway_runtime PUBLIC
     ${MARIADB_LIBRARY}
+    ${HIREDIS_LIBRARY}
     OpenSSL::Crypto
     Threads::Threads
 )
-target_compile_options(ai_gateway_phase3 PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(ai_gateway_runtime PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(AiGateway
     main.cpp
@@ -50,7 +58,7 @@ add_executable(AiGateway
 )
 
 target_include_directories(AiGateway PRIVATE ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(AiGateway PRIVATE ai_gateway_phase3 CURL::libcurl Threads::Threads)
+target_link_libraries(AiGateway PRIVATE ai_gateway_runtime CURL::libcurl Threads::Threads)
 target_compile_definitions(AiGateway PRIVATE
     BOOST_ASIO_NO_DEPRECATED
     BOOST_ERROR_CODE_HEADER_ONLY
@@ -59,7 +67,7 @@ target_compile_options(AiGateway PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(AiGatewayAdmin admin.cpp)
 target_include_directories(AiGatewayAdmin PRIVATE ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(AiGatewayAdmin PRIVATE ai_gateway_phase3)
+target_link_libraries(AiGatewayAdmin PRIVATE ai_gateway_runtime)
 target_compile_options(AiGatewayAdmin PRIVATE -Wall -Wextra -Wpedantic)
 
 if(BUILD_TESTING AND Python3_Interpreter_FOUND)

@@ -1,10 +1,10 @@
 # Cluster-Chat-Server
 
-> Migration status: Phase 0 through Phase 3 add an independent C++ AI API gateway while the legacy
+> Migration status: Phase 0 through Phase 4 add an independent C++ AI API gateway while the legacy
 > chat server remains available as a rollback target. See
 > [`ai-api-gateway-migration-spec.md`](ai-api-gateway-migration-spec.md).
 
-## AI Gateway (Phase 3)
+## AI Gateway (Phase 4)
 
 `AiGateway` exposes `GET /healthz`, `GET /readyz`, `GET /v1/models`, and streaming or non-streaming
 `POST /v1/responses`. It uses asynchronous Boost.Beast/Asio for ingress and one process-wide
@@ -12,13 +12,18 @@ libcurl multi transport for upstream requests. SSE responses are incrementally v
 relayed with bounded buffering, high/low-water backpressure, upstream cancellation on client
 disconnect, and separate first-event, idle, and maximum-duration timeouts.
 
-Phase 3 stores Tenant identity, HMAC-only API Keys, reusable Access Policies, Provider resources,
-and Tenant-scoped Logical Models in MySQL. Blocking SQL is isolated on a fixed worker pool. A
-configuration-version poll invalidates cached Auth Snapshots; database or schema failures make
-`/readyz` and new authorization fail closed while `/healthz` remains available. Provider secrets
-are resolved from `env:NAME` or a non-symlink `file:basename` below `AI_GATEWAY_SECRET_DIR`; plaintext
-Gateway or Provider keys are never stored in MySQL. Redis quotas, Usage, retries, routing, and
-failover remain out of scope.
+MySQL stores Tenant identity, HMAC-only API Keys, reusable Access Policies, Provider resources,
+Tenant-scoped Logical Models, Route Policies, and one audit row per Provider Attempt. Blocking SQL
+is isolated on a fixed worker pool. Redis shares session affinity, Candidate health, circuit state,
+and half-open probe leases across Gateway nodes. New proxy requests fail closed when either runtime
+store is unavailable; `/healthz` remains available, and `/v1/models` does not depend on Redis.
+
+Each Candidate is attempted at most once. Retryable pre-commit failures may move to another
+Candidate, up to the Route Policy limit; an SSE failure after the first business event never fails
+over. Provider secrets are resolved from `env:NAME` or a non-symlink `file:basename` below
+`AI_GATEWAY_SECRET_DIR`. API Keys, Provider secrets, URLs, affinity values, Prompts, and response
+bodies are excluded from runtime stores and logs. Quota, Usage, pricing, budgets, and Prometheus
+remain out of scope.
 
 Configure the Gateway DB and HMAC pepper values in `.env`, then build:
 
@@ -63,7 +68,7 @@ curl -N http://127.0.0.1:8080/v1/responses \
   -d '{"model":"your-logical-model","input":"hello","stream":true}'
 ```
 
-The runtime identity controls use these defaults:
+The identity and audit runtime controls use these defaults:
 
 | Variable | Default | Meaning |
 |---|---:|---|
@@ -73,6 +78,29 @@ The runtime identity controls use these defaults:
 | `AI_GATEWAY_AUTH_CACHE_TTL_SECONDS` | `30` | Auth Snapshot cache lifetime |
 | `AI_GATEWAY_AUTH_CACHE_MAX_ENTRIES` | `10000` | Auth Snapshot LRU capacity |
 | `AI_GATEWAY_CONFIG_POLL_INTERVAL_MS` | `1000` | Configuration-version poll interval |
+
+The shared routing controls use these defaults:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `AI_GATEWAY_REDIS_HOST` | `127.0.0.1` | Redis host |
+| `AI_GATEWAY_REDIS_PORT` | `6379` | Redis port |
+| `AI_GATEWAY_REDIS_DATABASE` | `0` | Redis logical database |
+| `AI_GATEWAY_REDIS_WORKERS` | `2` | Fixed blocking Redis worker count |
+| `AI_GATEWAY_REDIS_QUEUE_SIZE` | `4096` | Maximum queued Redis operations |
+| `AI_GATEWAY_REDIS_CONNECT_TIMEOUT_MS` | `1000` | Redis connection timeout |
+| `AI_GATEWAY_REDIS_COMMAND_TIMEOUT_MS` | `500` | Redis command timeout |
+| `AI_GATEWAY_REDIS_KEY_PREFIX` | `aigw` | Namespace for Gateway routing keys |
+| `AI_GATEWAY_AFFINITY_TTL_SECONDS` | `300` | Successful Candidate affinity lifetime |
+| `AI_GATEWAY_ROUTING_HEALTH_TTL_SECONDS` | `3600` | Candidate health-state lifetime |
+| `AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD` | `3` | Consecutive failures before opening |
+| `AI_GATEWAY_CIRCUIT_OPEN_MS` | `30000` | Default open-circuit cooldown |
+| `AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS` | `10000` | Single half-open probe lease |
+
+`AI_GATEWAY_REDIS_USERNAME` and `AI_GATEWAY_REDIS_PASSWORD` are optional. Route modes are
+`fixed_order`, `load_balance`, and `cache_affinity`; old Logical Models without an explicit Route
+Policy use `fixed_order` with at most three Attempts. Mapping priority defaults to `100`, and lower
+values are preferred.
 
 The stream controls use these defaults:
 
@@ -88,15 +116,17 @@ The low watermark must be below the high watermark, and prefetch must not exceed
 watermark. The Nginx HTTP/1.1 reverse-proxy example for SSE is
 [`deploy/nginx/ai-gateway.conf.example`](deploy/nginx/ai-gateway.conf.example).
 
-Run the localhost integration tests, which start a temporary MariaDB and Mock Provider, with:
+Run the localhost integration tests, which start temporary MariaDB and Redis instances, two Mock
+Providers, and two Gateway nodes, with:
 
 ```shell
 ctest --test-dir build/gateway --output-on-failure
 ```
 
-The captured Codex client requests `stream=true`; its request and event contract is covered by the
-localhost Provider fixture. Architectural decisions and the captured contract are in
-`docs/adr/` and `docs/compatibility/`.
+When Nginx is installed, the suite also checks the non-root example configuration and incremental
+SSE delivery through Nginx. The captured Codex client requests `stream=true`; its request and event
+contract is covered by the localhost Provider fixture. Architectural decisions and the captured
+contract are in `docs/adr/` and `docs/compatibility/`.
 
 ### Lingsuan Provider
 
@@ -145,7 +175,7 @@ Ubuntu 终端内编译和运行，并把仓库放在 Linux 文件系统（例如
 `~/Cluster-Chat-Server`）中；不要放在 `/mnt/c`，否则 CMake 编译和文件访问会明显变慢。
 
 当前适配并验证的环境为 Ubuntu 24.04。基础运行需要 Muduo、MariaDB/MySQL、
-Redis、hiredis、Boost 和 libcurl；Nginx 只在学习多服务器负载均衡章节时才需要。
+Redis、hiredis、Boost 和 libcurl；Nginx 也可用于 Gateway 的 HTTP/1.1 SSE 反向代理验收。
 
 ### 1. 初始化环境
 

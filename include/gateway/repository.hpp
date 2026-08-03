@@ -18,12 +18,18 @@ struct RepositoryModel
     std::string name;
     std::string status;
     bool granted = false;
+    std::string scheduling_mode = "fixed_order";
+    std::size_t max_attempts = 3;
 };
 
 struct RepositoryMapping
 {
+    std::uint64_t mapping_id = 0;
     std::uint64_t logical_model_id = 0;
+    std::string mapping_name;
     std::uint64_t provider_id = 0;
+    std::uint64_t endpoint_id = 0;
+    std::uint64_t credential_id = 0;
     std::uint64_t endpoint_provider_id = 0;
     std::uint64_t credential_provider_id = 0;
     std::string provider_status;
@@ -33,6 +39,7 @@ struct RepositoryMapping
     std::string secret_ref;
     std::string credential_status;
     std::string upstream_model;
+    std::uint16_t priority = 100;
     std::string mapping_status;
 };
 
@@ -40,6 +47,7 @@ struct RepositoryAccessRecord
 {
     std::uint64_t config_version = 0;
     std::uint64_t database_key_id = 0;
+    std::uint64_t database_tenant_id = 0;
     std::string public_key_id;
     std::string key_hmac;
     std::string key_status;
@@ -54,6 +62,33 @@ struct RepositoryAccessRecord
     std::vector<RepositoryMapping> mappings;
 };
 
+struct AttemptStart
+{
+    std::string attempt_id;
+    std::string request_id;
+    std::size_t attempt_number = 0;
+    std::uint64_t tenant_id = 0;
+    std::uint64_t api_key_id = 0;
+    std::uint64_t logical_model_id = 0;
+    std::uint64_t mapping_id = 0;
+    std::uint64_t provider_id = 0;
+    std::uint64_t endpoint_id = 0;
+    std::uint64_t credential_id = 0;
+    bool stream = false;
+};
+
+struct AttemptFinish
+{
+    std::string attempt_id;
+    std::string state;
+    long provider_status = 0;
+    std::string error_class;
+    bool retryable = false;
+    bool possible_duplicate_cost = false;
+    std::size_t response_bytes = 0;
+    std::uint64_t duration_ms = 0;
+};
+
 class GatewayRepository
 {
 public:
@@ -61,6 +96,8 @@ public:
     virtual std::uint64_t config_version() = 0;
     virtual std::vector<RepositoryAccessRecord> load_access_candidates(
         const std::string &display_prefix) = 0;
+    virtual void begin_attempt(const AttemptStart &attempt) = 0;
+    virtual void finish_attempt(const AttemptFinish &attempt) = 0;
 };
 
 class MySqlGatewayRepository final : public GatewayRepository
@@ -72,6 +109,8 @@ public:
     std::uint64_t config_version() override;
     std::vector<RepositoryAccessRecord> load_access_candidates(
         const std::string &display_prefix) override;
+    void begin_attempt(const AttemptStart &attempt) override;
+    void finish_attempt(const AttemptFinish &attempt) override;
 
 private:
     class Impl;

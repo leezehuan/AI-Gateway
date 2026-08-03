@@ -106,19 +106,37 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
                                  "status": "active"}],
             }],
             "logical_models": [{"tenant": "tenant-a", "protocol": "responses",
-                                "name": "shared-model", "status": "active"}],
+                                "name": "shared-model", "status": "active",
+                                "routing": {"mode": "load_balance", "max_attempts": 5}}],
             "policies": [{"tenant": "tenant-a", "slug": "default", "name": "Default",
                           "status": "active", "protocols": ["responses"],
                           "models": ["shared-model"], "providers": ["provider-a"]}],
             "mappings": [{"tenant": "tenant-a", "logical_model": "shared-model",
                           "protocol": "responses", "name": "primary", "provider": "provider-a",
                           "endpoint": "responses", "credential": "default",
-                          "upstream_model": "provider-model-a", "status": "active"}],
+                          "upstream_model": "provider-model-a", "priority": 7,
+                          "status": "active"}],
         }
         path = os.path.join(self.temp.name, "config.json")
         with open(path, "w", encoding="utf-8") as output:
             json.dump(config, output)
         self.run_admin("apply-config", "--file", path)
+        self.assertEqual(
+            self.query(
+                "SELECT rp.scheduling_mode, rp.max_attempts, mm.priority "
+                "FROM route_policies rp JOIN logical_models lm ON lm.id=rp.logical_model_id "
+                "JOIN model_mappings mm ON mm.logical_model_id=lm.id "
+                "WHERE lm.name='shared-model'"
+            ),
+            "load_balance\t5\t7",
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema='ai_gateway' AND table_name='request_attempts'"
+            ),
+            "1",
+        )
         applied_version = int(self.query(
             "SELECT version FROM gateway_config_versions WHERE singleton_id=1"
         ))

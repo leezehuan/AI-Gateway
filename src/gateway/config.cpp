@@ -99,6 +99,30 @@ GatewayConfig GatewayConfig::from_env()
         2, std::min<std::size_t>(8, std::thread::hardware_concurrency()));
     config.io_threads = env_number<std::size_t>(
         "AI_GATEWAY_IO_THREADS", default_threads, 1, 64);
+    config.redis_host = env_string("AI_GATEWAY_REDIS_HOST", "127.0.0.1");
+    config.redis_port = env_number<std::uint16_t>(
+        "AI_GATEWAY_REDIS_PORT", 6379, 1, std::numeric_limits<std::uint16_t>::max());
+    config.redis_username = env_string("AI_GATEWAY_REDIS_USERNAME");
+    config.redis_password = env_string("AI_GATEWAY_REDIS_PASSWORD");
+    config.redis_database = env_number<unsigned>("AI_GATEWAY_REDIS_DATABASE", 0, 0, 255);
+    config.redis_workers = env_number<std::size_t>("AI_GATEWAY_REDIS_WORKERS", 2, 1, 32);
+    config.redis_queue_size = env_number<std::size_t>(
+        "AI_GATEWAY_REDIS_QUEUE_SIZE", 4096, 1, 100000);
+    config.redis_connect_timeout_ms = env_number<long>(
+        "AI_GATEWAY_REDIS_CONNECT_TIMEOUT_MS", 1000, 10, 30000);
+    config.redis_command_timeout_ms = env_number<long>(
+        "AI_GATEWAY_REDIS_COMMAND_TIMEOUT_MS", 500, 10, 30000);
+    config.redis_key_prefix = env_string("AI_GATEWAY_REDIS_KEY_PREFIX", "aigw");
+    config.affinity_ttl_seconds = env_number<std::size_t>(
+        "AI_GATEWAY_AFFINITY_TTL_SECONDS", 300, 1, 86400);
+    config.routing_health_ttl_seconds = env_number<std::size_t>(
+        "AI_GATEWAY_ROUTING_HEALTH_TTL_SECONDS", 3600, 30, 604800);
+    config.circuit_failure_threshold = env_number<unsigned>(
+        "AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD", 3, 1, 100);
+    config.circuit_open_ms = env_number<long>(
+        "AI_GATEWAY_CIRCUIT_OPEN_MS", 30000, 100, 3600000);
+    config.circuit_probe_lease_ms = env_number<long>(
+        "AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS", 10000, 100, 60000);
     return config;
 }
 
@@ -112,6 +136,13 @@ void GatewayConfig::validate() const
     if (api_key_hmac_pepper.size() < 32)
     {
         throw std::runtime_error("AI_GATEWAY_API_KEY_HMAC_PEPPER must contain at least 32 bytes");
+    }
+    if (redis_host.empty() || redis_key_prefix.empty() ||
+        redis_key_prefix.find_first_not_of(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") !=
+            std::string::npos)
+    {
+        throw std::runtime_error("Gateway Redis configuration is invalid");
     }
 }
 } // namespace ai_gateway

@@ -3,6 +3,7 @@
 #include "gateway/http_server.hpp"
 #include "gateway/repository.hpp"
 #include "gateway/runtime.hpp"
+#include "gateway/routing.hpp"
 
 #include <exception>
 #include <iostream>
@@ -15,8 +16,10 @@ int main()
         config.validate();
         ai_gateway::MySqlGatewayRepository repository(config);
         ai_gateway::RuntimeState runtime(config, repository);
+        ai_gateway::HiredisRoutingStore routing_store(config);
+        ai_gateway::RoutingRuntime routing(config, routing_store);
         ai_gateway::CurlMultiProviderTransport transport;
-        ai_gateway::AiGateway gateway(runtime, transport);
+        ai_gateway::AiGateway gateway(runtime, routing, transport);
         ai_gateway::structured_log(
             "gateway_started",
             {{"listen_address", config.listen_address},

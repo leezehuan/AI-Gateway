@@ -15,6 +15,13 @@ namespace ai_gateway
 {
 struct ModelTarget
 {
+    std::uint64_t mapping_id = 0;
+    std::uint64_t provider_id = 0;
+    std::uint64_t endpoint_id = 0;
+    std::uint64_t credential_id = 0;
+    std::string mapping_name;
+    std::uint16_t priority = 100;
+    std::string fingerprint;
     std::string provider_url;
     std::string provider_api_key;
     std::string upstream_model;
@@ -22,8 +29,11 @@ struct ModelTarget
 
 struct ModelAccess
 {
+    std::uint64_t database_id = 0;
     std::string name;
     std::string protocol;
+    std::string scheduling_mode = "fixed_order";
+    std::size_t max_attempts = 3;
     bool model_granted = false;
     bool provider_denied = false;
     bool configuration_unavailable = false;
@@ -34,6 +44,8 @@ struct ModelAccess
 struct AuthSnapshot
 {
     std::uint64_t config_version = 0;
+    std::uint64_t database_tenant_id = 0;
+    std::uint64_t database_api_key_id = 0;
     std::string tenant_slug;
     std::string public_api_key_id;
     std::unordered_set<std::string> protocols;
@@ -58,6 +70,7 @@ class RuntimeState
 {
 public:
     using AuthCallback = std::function<void(AuthResult)>;
+    using AuditCallback = std::function<void(bool)>;
 
     RuntimeState(GatewayConfig config, GatewayRepository &repository);
     ~RuntimeState();
@@ -66,6 +79,8 @@ public:
     RuntimeState &operator=(const RuntimeState &) = delete;
 
     void authenticate(std::string api_key, AuthCallback callback);
+    void begin_attempt(AttemptStart attempt, AuditCallback callback);
+    void finish_attempt(AttemptFinish attempt, AuditCallback callback);
     bool ready() const;
     const GatewayConfig &config() const;
 

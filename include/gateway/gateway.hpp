@@ -18,6 +18,7 @@
 namespace ai_gateway
 {
 class RuntimeState;
+class RoutingRuntime;
 struct AuthSnapshot;
 using HeaderMap = std::unordered_map<std::string, std::string>;
 
@@ -92,6 +93,21 @@ struct GatewayConfig
     long stream_idle_timeout_ms = 60000;
     long stream_max_duration_ms = 900000;
     std::size_t io_threads = 2;
+    std::string redis_host = "127.0.0.1";
+    std::uint16_t redis_port = 6379;
+    std::string redis_username;
+    std::string redis_password;
+    unsigned redis_database = 0;
+    std::size_t redis_workers = 2;
+    std::size_t redis_queue_size = 4096;
+    long redis_connect_timeout_ms = 1000;
+    long redis_command_timeout_ms = 500;
+    std::string redis_key_prefix = "aigw";
+    std::size_t affinity_ttl_seconds = 300;
+    std::size_t routing_health_ttl_seconds = 3600;
+    unsigned circuit_failure_threshold = 3;
+    long circuit_open_ms = 30000;
+    long circuit_probe_lease_ms = 10000;
 
     static GatewayConfig from_env();
     void validate() const;
@@ -112,6 +128,9 @@ struct ProviderRequest
 enum class ProviderError
 {
     none,
+    dns_failure,
+    connection_failure,
+    tls_failure,
     timeout,
     response_too_large,
     cancelled,
@@ -126,6 +145,7 @@ struct ProviderResponse
     long status = 0;
     HeaderMap headers;
     std::string body;
+    bool request_may_have_been_sent = false;
 };
 
 struct ProviderResponseHead
@@ -169,7 +189,7 @@ public:
 class AiGateway
 {
 public:
-    AiGateway(RuntimeState &runtime, ProviderTransport &transport);
+    AiGateway(RuntimeState &runtime, RoutingRuntime &routing, ProviderTransport &transport);
 
     void handle(const GatewayRequest &request,
                 ResponseWriter &response,
@@ -184,6 +204,7 @@ private:
                            std::shared_ptr<const AuthSnapshot> snapshot);
 
     RuntimeState &runtime_;
+    RoutingRuntime &routing_;
     ProviderTransport &transport_;
 };
 

@@ -171,6 +171,15 @@ void validate_status(const std::string &status)
     }
 }
 
+void validate_scheduling_mode(const std::string &mode)
+{
+    if (mode != "fixed_order" && mode != "load_balance" && mode != "cache_affinity")
+    {
+        throw std::runtime_error(
+            "routing mode must be fixed_order, load_balance, or cache_affinity");
+    }
+}
+
 void validate_url(const std::string &url)
 {
     if ((url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) ||
@@ -395,10 +404,40 @@ void apply_config(MySqlConnection &connection, const json &root)
         validate_name(name, "Logical Model name");
         const auto tenant_id = require_id(connection,
             "SELECT id FROM tenants WHERE slug = ?", {tenant_slug}, tenant_slug);
-        upsert(connection,
+        const auto model_id = upsert(connection,
             "INSERT INTO logical_models(tenant_id, protocol, name, status) VALUES (?, ?, ?, ?) "
             "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), status=VALUES(status)",
             {std::to_string(tenant_id), protocol, name, status_of(model)}, changed);
+
+        std::string scheduling_mode = "fixed_order";
+        int max_attempts = 3;
+        if (model.contains("routing"))
+        {
+            const auto &routing = model["routing"];
+            if (!routing.is_object())
+            {
+                throw std::runtime_error("Logical Model routing must be an object");
+            }
+            scheduling_mode = routing.value("mode", "fixed_order");
+            if (routing.contains("max_attempts"))
+            {
+                if (!routing["max_attempts"].is_number_integer())
+                {
+                    throw std::runtime_error("routing max_attempts must be an integer");
+                }
+                max_attempts = routing["max_attempts"].get<int>();
+            }
+        }
+        validate_scheduling_mode(scheduling_mode);
+        if (max_attempts < 1 || max_attempts > 10)
+        {
+            throw std::runtime_error("routing max_attempts must be between 1 and 10");
+        }
+        upsert(connection,
+            "INSERT INTO route_policies(logical_model_id, scheduling_mode, max_attempts) "
+            "VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), "
+            "scheduling_mode=VALUES(scheduling_mode), max_attempts=VALUES(max_attempts)",
+            {std::to_string(model_id), scheduling_mode, std::to_string(max_attempts)}, changed);
     }
 
     for (const auto &policy : array_or_empty(root, "policies"))
@@ -489,16 +528,31 @@ void apply_config(MySqlConnection &connection, const json &root)
             "Provider Credential");
         const std::string mapping_name = mapping.value("name", provider_slug);
         validate_name(mapping_name, "Model Mapping name");
+        int priority = 100;
+        if (mapping.contains("priority"))
+        {
+            if (!mapping["priority"].is_number_integer())
+            {
+                throw std::runtime_error("Model Mapping priority must be an integer");
+            }
+            priority = mapping["priority"].get<int>();
+        }
+        if (priority < 0 || priority > 65535)
+        {
+            throw std::runtime_error("Model Mapping priority must be between 0 and 65535");
+        }
         upsert(connection,
             "INSERT INTO model_mappings(logical_model_id, name, provider_endpoint_id, "
-            "provider_credential_id, upstream_model, status) VALUES (?, ?, ?, ?, ?, ?) "
+            "provider_credential_id, upstream_model, priority, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), "
             "provider_endpoint_id=VALUES(provider_endpoint_id), "
             "provider_credential_id=VALUES(provider_credential_id), "
-            "upstream_model=VALUES(upstream_model), status=VALUES(status)",
+            "upstream_model=VALUES(upstream_model), priority=VALUES(priority), "
+            "status=VALUES(status)",
             {std::to_string(model_id), mapping_name, std::to_string(endpoint_id),
              std::to_string(credential_id), required_string(mapping, "upstream_model"),
-             status_of(mapping)}, changed);
+             std::to_string(priority), status_of(mapping)}, changed);
     }
 
     if (changed)

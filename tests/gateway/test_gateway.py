@@ -96,6 +96,8 @@ class MockProviderHandler(BaseHTTPRequestHandler):
 
         if scenario == "slow":
             time.sleep(1.2)
+        if scenario == "slow_success":
+            time.sleep(0.3)
         if scenario == "stream_split_crlf":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -302,6 +304,14 @@ class MockProviderHandler(BaseHTTPRequestHandler):
                 b"data: [DONE]\n\n",
                 "text/event-stream",
             )
+        elif scenario == "stream_minimal_success":
+            self.send_raw(
+                200,
+                b'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+                b'event: response.completed\ndata: {"type":"response.completed","sequence_number":1}\n\n'
+                b"data: [DONE]\n\n",
+                "text/event-stream",
+            )
         elif scenario == "stream_success":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -356,6 +366,11 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             self.send_raw(200, b"not-json", "application/json")
         elif scenario == "too_large":
             self.send_raw(200, b"{" + b"x" * 3000 + b"}", "application/json")
+        elif scenario == "slow":
+            try:
+                self.send_json(200, {"id": "resp_late", "object": "response", "output": []})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self.send_json(
                 200,
@@ -401,6 +416,16 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.provider.state = cls.provider_state
         cls.provider_thread = threading.Thread(target=cls.provider.serve_forever, daemon=True)
         cls.provider_thread.start()
+        cls.provider_secondary_state = MockProviderState()
+        cls.provider_secondary_port = free_port()
+        cls.provider_secondary = ThreadingHTTPServer(
+            ("127.0.0.1", cls.provider_secondary_port), MockProviderHandler
+        )
+        cls.provider_secondary.state = cls.provider_secondary_state
+        cls.provider_secondary_thread = threading.Thread(
+            target=cls.provider_secondary.serve_forever, daemon=True
+        )
+        cls.provider_secondary_thread.start()
 
         cls.database_temp = tempfile.TemporaryDirectory(prefix="aigw-http-")
         cls.secret_dir = os.path.join(cls.database_temp.name, "secrets")
@@ -439,6 +464,23 @@ class GatewayIntegrationTest(unittest.TestCase):
              "GRANT ALL ON ai_gateway.* TO 'gateway'@'127.0.0.1'; FLUSH PRIVILEGES;"],
             check=True,
         )
+        cls.redis_port = free_port()
+        cls.redis = subprocess.Popen(
+            ["redis-server", "--bind", "127.0.0.1", "--port", str(cls.redis_port),
+             "--save", "", "--appendonly", "no", "--dir", cls.database_temp.name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            probe = subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(cls.redis_port), "PING"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            if probe.returncode == 0 and probe.stdout.strip() == "PONG":
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("temporary Redis did not start")
         cls.run_admin("migrate", "--dir", os.path.join(cls.repo, "migrations", "gateway"))
         config = cls.phase3_config()
         config_path = os.path.join(cls.database_temp.name, "config.json")
@@ -491,6 +533,7 @@ class GatewayIntegrationTest(unittest.TestCase):
                 "AI_GATEWAY_STREAM_BUFFER_LOW_WATER_BYTES": "2048",
                 "AI_GATEWAY_STREAM_IDLE_TIMEOUT_MS": "500",
                 "AI_GATEWAY_STREAM_MAX_DURATION_MS": "1000",
+                "AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD": "100",
             }
         )
         cls.gateway = subprocess.Popen(
@@ -510,6 +553,25 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.log_thread = threading.Thread(target=drain, daemon=True)
         cls.log_thread.start()
         cls.wait_for_gateway()
+
+        cls.gateway_secondary_port = free_port()
+        cls.gateway_secondary = subprocess.Popen(
+            [cls.gateway_binary],
+            env=cls.gateway_environment(cls.gateway_secondary_port),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        cls.secondary_logs = []
+
+        def drain_secondary():
+            for line in cls.gateway_secondary.stdout:
+                cls.secondary_logs.append(line)
+
+        cls.secondary_log_thread = threading.Thread(target=drain_secondary, daemon=True)
+        cls.secondary_log_thread.start()
+        cls.wait_for_gateway_port(cls.gateway_secondary_port)
 
     @classmethod
     def gateway_environment(cls, listen_port):
@@ -534,8 +596,15 @@ class GatewayIntegrationTest(unittest.TestCase):
             "AI_GATEWAY_CONFIG_POLL_INTERVAL_MS": "200",
             "AI_GATEWAY_API_KEY_HMAC_PEPPER": "phase3-test-pepper-that-is-at-least-32-bytes",
             "AI_GATEWAY_SECRET_DIR": cls.secret_dir,
+            "AI_GATEWAY_REDIS_HOST": "127.0.0.1",
+            "AI_GATEWAY_REDIS_PORT": str(cls.redis_port),
+            "AI_GATEWAY_REDIS_WORKERS": "2",
+            "AI_GATEWAY_REDIS_QUEUE_SIZE": "256",
+            "AI_GATEWAY_REDIS_CONNECT_TIMEOUT_MS": "200",
+            "AI_GATEWAY_REDIS_COMMAND_TIMEOUT_MS": "200",
             "TEST_PROVIDER_SECRET_A": PROVIDER_KEY,
             "TEST_PROVIDER_SECRET_B": PROVIDER_KEY_B,
+            "TEST_PROVIDER_SECRET_FAILOVER": "provider-failover-secret-never-store",
         })
         return environment
 
@@ -586,6 +655,7 @@ class GatewayIntegrationTest(unittest.TestCase):
     @classmethod
     def phase3_config(cls):
         endpoint = f"http://127.0.0.1:{cls.provider_port}/v1/responses"
+        secondary_endpoint = f"http://127.0.0.1:{cls.provider_secondary_port}/v1/responses"
         return {
             "tenants": [
                 {"slug": "tenant-a", "name": "Tenant A", "status": "active"},
@@ -606,6 +676,13 @@ class GatewayIntegrationTest(unittest.TestCase):
                                 "url": endpoint, "status": "active"}],
                  "credentials": [{"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_B",
                                   "status": "active"}]},
+                {"tenant": "tenant-a", "slug": "provider-secondary",
+                 "name": "Provider Secondary", "status": "active",
+                 "endpoints": [{"name": "responses", "protocol": "responses",
+                                "url": secondary_endpoint, "status": "active"}],
+                 "credentials": [{"name": "default",
+                                  "secret_ref": "env:TEST_PROVIDER_SECRET_FAILOVER",
+                                  "status": "active"}]},
             ],
             "logical_models": [
                 {"tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
@@ -618,7 +695,8 @@ class GatewayIntegrationTest(unittest.TestCase):
             "policies": [
                 {"tenant": "tenant-a", "slug": "default", "name": "Default A",
                  "status": "active", "protocols": ["responses"],
-                 "models": ["gateway-model"], "providers": ["provider-a"]},
+                 "models": ["gateway-model"],
+                 "providers": ["provider-a", "provider-secondary"]},
                 {"tenant": "tenant-b", "slug": "default", "name": "Default B",
                  "status": "active", "protocols": ["responses"],
                  "models": ["gateway-model", "tenant-b-only"], "providers": ["provider-b"]},
@@ -652,6 +730,14 @@ class GatewayIntegrationTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.gateway_secondary.terminate()
+        try:
+            cls.gateway_secondary.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.gateway_secondary.kill()
+            cls.gateway_secondary.wait(timeout=5)
+        cls.gateway_secondary.stdout.close()
+        cls.secondary_log_thread.join(timeout=1)
         cls.gateway.terminate()
         try:
             cls.gateway.wait(timeout=5)
@@ -662,18 +748,26 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.log_thread.join(timeout=1)
         cls.provider.shutdown()
         cls.provider.server_close()
+        cls.provider_secondary.shutdown()
+        cls.provider_secondary.server_close()
+        cls.redis.terminate()
+        cls.redis.wait(timeout=5)
         cls.database.terminate()
         cls.database.wait(timeout=5)
         cls.database_temp.cleanup()
 
     @classmethod
     def wait_for_gateway(cls):
+        cls.wait_for_gateway_port(cls.gateway_port)
+
+    @classmethod
+    def wait_for_gateway_port(cls, port):
         deadline = time.time() + 5
         while time.time() < deadline:
             try:
-                status, _, _ = cls.request("GET", "/healthz")
+                status, _, _ = cls.request_at(port, "GET", "/healthz")
                 if status == 200:
-                    ready, _, _ = cls.request("GET", "/readyz")
+                    ready, _, _ = cls.request_at(port, "GET", "/readyz")
                     if ready == 200:
                         return
             except OSError:
@@ -683,7 +777,11 @@ class GatewayIntegrationTest(unittest.TestCase):
 
     @classmethod
     def request(cls, method, path, body=None, headers=None, timeout=3):
-        connection = http.client.HTTPConnection("127.0.0.1", cls.gateway_port, timeout=timeout)
+        return cls.request_at(cls.gateway_port, method, path, body, headers, timeout)
+
+    @classmethod
+    def request_at(cls, port, method, path, body=None, headers=None, timeout=3):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         encoded = None
         request_headers = dict(headers or {})
         if body is not None:
@@ -695,6 +793,26 @@ class GatewayIntegrationTest(unittest.TestCase):
         result = (response.status, dict(response.getheaders()), data)
         connection.close()
         return result
+
+    @classmethod
+    def start_redis(cls):
+        process = subprocess.Popen(
+            ["redis-server", "--bind", "127.0.0.1", "--port", str(cls.redis_port),
+             "--save", "", "--appendonly", "no", "--dir", cls.database_temp.name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            probe = subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(cls.redis_port), "PING"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            if probe.returncode == 0 and probe.stdout.strip() == "PONG":
+                return process
+            time.sleep(0.05)
+        process.terminate()
+        process.wait(timeout=5)
+        raise RuntimeError("temporary Redis did not restart")
 
     def setUp(self):
         self.provider_state.reset()
@@ -1060,7 +1178,7 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.apply_config_patch({"mappings": [mapping]}, "mapping-restore.json")
             self.wait_for_model()
 
-    def test_phase3_missing_secret_and_duplicate_mapping_are_unavailable(self):
+    def test_phase4_missing_secret_is_unavailable_and_fixed_order_accepts_multiple_mappings(self):
         provider = {
             "tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
             "status": "active", "credentials": [
@@ -1092,22 +1210,28 @@ class GatewayIntegrationTest(unittest.TestCase):
             "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
             "name": "secondary", "provider": "provider-a", "endpoint": "responses",
             "credential": "default", "upstream_model": "duplicate-provider-model",
-            "status": "active",
+            "priority": 200, "status": "active",
         }
         try:
             self.apply_config_patch({"mappings": [secondary]}, "duplicate-mapping.json")
+            time.sleep(0.4)
             deadline = time.time() + 2
+            observed = None
             while time.time() < deadline:
+                self.provider_state.reset()
                 status, _, body = self.request(
                     "POST", "/v1/responses",
                     json.dumps({"model": "gateway-model", "input": "duplicate"}),
                     {"Authorization": f"Bearer {GATEWAY_KEY}"},
                 )
-                if status == 503:
+                if status == 200:
+                    _, requests = self.provider_state.snapshot()
+                    if requests:
+                        observed = requests[-1]["payload"]["model"]
                     break
                 time.sleep(0.05)
-            self.assertEqual(status, 503)
-            self.assertEqual(json.loads(body)["error"]["code"], "model_unavailable")
+            self.assertEqual(status, 200, body)
+            self.assertEqual(observed, "provider-model")
         finally:
             secondary["status"] = "disabled"
             self.apply_config_patch({"mappings": [secondary]}, "duplicate-restore.json")
@@ -1545,6 +1669,67 @@ class GatewayIntegrationTest(unittest.TestCase):
             normalized = {key.lower(): value for key, value in headers.items()}
             self.assertEqual(normalized.get("content-type"), "application/json")
 
+    def test_phase4_stream_failover_stops_after_downstream_commit(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "stream-failover", "provider": "provider-secondary",
+            "endpoint": "responses", "credential": "default",
+            "upstream_model": "provider-secondary-model", "priority": 200,
+            "status": "active",
+        }
+        try:
+            self.apply_config_patch({"mappings": [secondary]}, "stream-failover-enable.json")
+            time.sleep(0.4)
+
+            for scenario in (
+                "stream_error_first",
+                "stream_wrong_content_type",
+                "stream_malformed_first",
+                "stream_oversized_first",
+            ):
+                subprocess.run(
+                    ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "FLUSHDB"],
+                    check=True, stdout=subprocess.DEVNULL,
+                )
+                self.provider_state.reset(scenario)
+                self.provider_secondary_state.reset(
+                    "stream_minimal_success" if scenario == "stream_oversized_first"
+                    else "stream_success"
+                )
+                status, _, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({
+                        "model": "gateway-model", "input": "before commit", "stream": True,
+                    }),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=4,
+                )
+                self.assertEqual(status, 200, (scenario, body))
+                self.assertTrue(body.endswith(b"data: [DONE]\n\n"), scenario)
+                self.assertNotIn(b"event: error", body, scenario)
+                self.assertEqual(len(self.provider_state.snapshot()[1]), 1, scenario)
+                self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1, scenario)
+
+            subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "FLUSHDB"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            self.provider_state.reset("stream_close_after_commit")
+            self.provider_secondary_state.reset("stream_success")
+            status, _, body = self.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "after commit", "stream": True}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=4,
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body.count(b"event: error"), 1)
+            self.assertFalse(body.endswith(b"data: [DONE]\n\n"))
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 0)
+        finally:
+            secondary["status"] = "disabled"
+            self.apply_config_patch({"mappings": [secondary]}, "stream-failover-disable.json")
+            time.sleep(0.4)
+
     def test_streaming_failure_after_commit_is_one_terminal_error_event(self):
         for scenario in (
             "stream_close_after_commit",
@@ -1627,6 +1812,19 @@ class GatewayIntegrationTest(unittest.TestCase):
             while time.time() < deadline and self.provider_state.active_count() != 0:
                 time.sleep(0.01)
             self.assertEqual(self.provider_state.active_count(), 0, scenario)
+            provider_requests = self.provider_state.snapshot()[1]
+            request_id = provider_requests[-1]["headers"]["x-request-id"]
+            deadline = time.time() + 2
+            attempt_state = ""
+            while time.time() < deadline:
+                attempt_state = self.database_query(
+                    "SELECT state FROM request_attempts "
+                    f"WHERE request_id='{request_id}' ORDER BY attempt_number DESC LIMIT 1"
+                ).strip()
+                if attempt_state == "cancelled":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(attempt_state, "cancelled", scenario)
 
     def test_slow_client_backpressures_and_resumes_without_event_loss(self):
         self.provider_state.reset("stream_backpressure")
@@ -1780,6 +1978,523 @@ class GatewayIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(status, 502)
             self.assertEqual(json.loads(body)["error"]["code"], code)
+
+    def test_phase4_precommit_5xx_fails_over_and_audits_each_attempt(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "failover", "provider": "provider-secondary", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-secondary-model",
+            "priority": 200, "status": "active",
+        }
+        try:
+            self.apply_config_patch({"mappings": [secondary]}, "failover-enable.json")
+            time.sleep(0.4)
+            self.provider_state.reset("status500")
+            self.provider_secondary_state.reset()
+            status, headers, body = self.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "failover-audit"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+            secondary_requests = self.provider_secondary_state.snapshot()[1]
+            self.assertEqual(len(secondary_requests), 1)
+            self.assertEqual(secondary_requests[0]["payload"]["model"], "provider-secondary-model")
+            self.assertEqual(
+                secondary_requests[0]["headers"]["authorization"],
+                "Bearer provider-failover-secret-never-store",
+            )
+
+            request_id = {key.lower(): value for key, value in headers.items()}["x-request-id"]
+            deadline = time.time() + 2
+            attempts = ""
+            while time.time() < deadline:
+                attempts = self.database_query(
+                    "SELECT attempt_number, state, provider_status, error_class, retryable, "
+                    "possible_duplicate_cost FROM request_attempts "
+                    f"WHERE request_id='{request_id}' ORDER BY attempt_number"
+                ).strip()
+                if len(attempts.splitlines()) == 2:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(
+                attempts.splitlines(),
+                ["1\tfailed\t500\tupstream_unavailable\t1\t1",
+                 "2\tsucceeded\t200\tsuccess\t0\t0"],
+            )
+            completion = None
+            deadline = time.time() + 2
+            while time.time() < deadline and completion is None:
+                for line in self.logs:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (record.get("event") == "request_completed" and
+                            record.get("request_id") == request_id):
+                        completion = record
+                        break
+                time.sleep(0.01)
+            self.assertIsNotNone(completion)
+            self.assertEqual(completion["failover_count"], "1")
+            attempt_logs = []
+            for line in self.logs:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (record.get("event") == "attempt_completed" and
+                        record.get("request_id") == request_id):
+                    attempt_logs.append(record)
+            self.assertEqual(len(attempt_logs), 2)
+            for record in attempt_logs:
+                self.assertEqual(record["tenant_slug"], "tenant-a")
+                self.assertEqual(record["api_key_id"], self.public_key_id(GATEWAY_KEY))
+                self.assertIn("attempt_id", record)
+                self.assertIn("candidate", record)
+                self.assertIn("retryable", record)
+                self.assertIn("possible_duplicate_cost", record)
+            audit_dump = self.database_query(
+                "SELECT * FROM request_attempts "
+                f"WHERE request_id='{request_id}' ORDER BY attempt_number"
+            )
+            for sensitive in (
+                GATEWAY_KEY, PROVIDER_KEY, "failover-audit",
+                f"http://127.0.0.1:{self.provider_port}/v1/responses",
+            ):
+                self.assertNotIn(sensitive, audit_dump)
+        finally:
+            secondary["status"] = "disabled"
+            self.apply_config_patch({"mappings": [secondary]}, "failover-disable.json")
+            time.sleep(0.4)
+
+    def test_phase4_other_retryable_precommit_failures_fail_over(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "failure-matrix", "provider": "provider-secondary", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-secondary-model",
+            "priority": 200, "status": "active",
+        }
+        try:
+            self.apply_config_patch({"mappings": [secondary]}, "failure-matrix-enable.json")
+            time.sleep(0.4)
+            for scenario in ("status429", "invalid_json", "too_large"):
+                subprocess.run(
+                    ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "FLUSHDB"],
+                    check=True, stdout=subprocess.DEVNULL,
+                )
+                self.provider_state.reset(scenario)
+                self.provider_secondary_state.reset()
+                status, _, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": f"failure-{scenario}"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                self.assertEqual(status, 200, (scenario, body))
+                self.assertEqual(len(self.provider_state.snapshot()[1]), 1, scenario)
+                self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1, scenario)
+        finally:
+            secondary["status"] = "disabled"
+            self.apply_config_patch({"mappings": [secondary]}, "failure-matrix-disable.json")
+            time.sleep(0.4)
+
+    def test_phase4_connection_failure_fails_over_without_duplicate_cost_risk(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "connection-backup", "provider": "provider-secondary",
+            "endpoint": "responses", "credential": "default",
+            "upstream_model": "provider-secondary-model", "priority": 200, "status": "active",
+        }
+        provider = {
+            "tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
+            "status": "active", "endpoints": [{
+                "name": "responses", "protocol": "responses",
+                "url": f"http://127.0.0.1:{free_port()}/v1/responses", "status": "active",
+            }],
+        }
+        try:
+            self.apply_config_patch(
+                {"providers": [provider], "mappings": [secondary]},
+                "connection-failure-enable.json",
+            )
+            time.sleep(0.4)
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            status, headers, body = self.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "connection failover"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 0)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+            request_id = next(
+                value for key, value in headers.items() if key.lower() == "x-request-id"
+            )
+            audit = self.database_query(
+                "SELECT error_class, retryable, possible_duplicate_cost FROM request_attempts "
+                f"WHERE request_id='{request_id}' AND attempt_number=1"
+            ).strip()
+            self.assertEqual(audit, "upstream_connection_failure\t1\t0")
+        finally:
+            provider["endpoints"][0]["url"] = (
+                f"http://127.0.0.1:{self.provider_port}/v1/responses"
+            )
+            secondary["status"] = "disabled"
+            self.apply_config_patch(
+                {"providers": [provider], "mappings": [secondary]},
+                "connection-failure-disable.json",
+            )
+            time.sleep(0.4)
+
+    def test_phase4_first_byte_timeout_fails_over_with_duplicate_cost_risk(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "timeout-backup", "provider": "provider-secondary", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-secondary-model",
+            "priority": 200, "status": "active",
+        }
+        process = None
+        try:
+            self.apply_config_patch({"mappings": [secondary]}, "timeout-failover-enable.json")
+            time.sleep(0.4)
+            subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "FLUSHDB"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            port = free_port()
+            environment = self.gateway_environment(port)
+            environment["AI_GATEWAY_UPSTREAM_TIMEOUT_MS"] = "150"
+            process = subprocess.Popen(
+                [self.gateway_binary], env=environment,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.wait_for_gateway_port(port)
+            self.provider_state.reset("slow")
+            self.provider_secondary_state.reset()
+            status, headers, body = self.request_at(
+                port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "timeout failover"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=3,
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+            request_id = next(
+                value for key, value in headers.items() if key.lower() == "x-request-id"
+            )
+            audit = self.database_query(
+                "SELECT error_class, retryable, possible_duplicate_cost FROM request_attempts "
+                f"WHERE request_id='{request_id}' AND attempt_number=1"
+            ).strip()
+            self.assertEqual(audit, "upstream_timeout\t1\t1")
+        finally:
+            if process is not None:
+                process.terminate()
+                process.wait(timeout=5)
+            secondary["status"] = "disabled"
+            self.apply_config_patch({"mappings": [secondary]}, "timeout-failover-disable.json")
+            time.sleep(0.4)
+
+    def test_phase4_cache_affinity_is_shared_between_gateway_nodes(self):
+        model = {
+            "tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
+            "status": "active", "routing": {"mode": "cache_affinity", "max_attempts": 3},
+        }
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "affinity", "provider": "provider-secondary", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-secondary-model",
+            "priority": 100, "status": "active",
+        }
+        session_id = "codex-session-must-never-enter-redis"
+        try:
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [secondary]},
+                "affinity-enable.json",
+            )
+            time.sleep(1.0)
+            headers = {
+                "Authorization": f"Bearer {GATEWAY_KEY}",
+                "originator": "codex",
+                "session-id": session_id,
+            }
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            status, _, body = self.request_at(
+                self.gateway_port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "affinity first"}), headers,
+            )
+            self.assertEqual(status, 200, body)
+            first = "primary" if self.provider_state.snapshot()[1] else "secondary"
+            self.assertEqual(
+                len(self.provider_state.snapshot()[1]) +
+                len(self.provider_secondary_state.snapshot()[1]),
+                1,
+            )
+
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            status, _, body = self.request_at(
+                self.gateway_secondary_port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "affinity second"}), headers,
+            )
+            self.assertEqual(status, 200, body)
+            second = "primary" if self.provider_state.snapshot()[1] else "secondary"
+            self.assertEqual(second, first)
+
+            keys = subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "--scan"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout
+            redis_contents = keys
+            for key in keys.splitlines():
+                value_type = subprocess.run(
+                    ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port),
+                     "--raw", "TYPE", key],
+                    check=True, text=True, stdout=subprocess.PIPE,
+                ).stdout.strip()
+                command = "HGETALL" if value_type == "hash" else "GET"
+                redis_contents += subprocess.run(
+                    ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port),
+                     "--raw", command, key],
+                    check=True, text=True, stdout=subprocess.PIPE,
+                ).stdout
+            for sensitive in (
+                session_id, GATEWAY_KEY, PROVIDER_KEY,
+                "affinity first", "affinity second",
+            ):
+                self.assertNotIn(sensitive, redis_contents)
+        finally:
+            model["routing"] = {"mode": "fixed_order", "max_attempts": 3}
+            secondary["status"] = "disabled"
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [secondary]},
+                "affinity-disable.json",
+            )
+            time.sleep(1.0)
+
+    def test_phase4_redis_outage_fails_proxy_closed_and_recovers(self):
+        self.redis.terminate()
+        self.redis.wait(timeout=5)
+        try:
+            deadline = time.time() + 3
+            statuses = (200, 200)
+            while time.time() < deadline:
+                statuses = (
+                    self.request_at(self.gateway_port, "GET", "/readyz")[0],
+                    self.request_at(self.gateway_secondary_port, "GET", "/readyz")[0],
+                )
+                if statuses == (503, 503):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(statuses, (503, 503))
+            self.assertEqual(self.request("GET", "/healthz")[0], 200)
+            self.assertEqual(
+                self.request(
+                    "GET", "/v1/models", headers={"Authorization": f"Bearer {GATEWAY_KEY}"}
+                )[0],
+                200,
+            )
+            status, _, body = self.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "redis unavailable"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)["error"]["code"], "routing_unavailable")
+        finally:
+            self.redis = self.start_redis()
+            self.wait_for_gateway_port(self.gateway_port)
+            self.wait_for_gateway_port(self.gateway_secondary_port)
+
+    def test_phase4_load_balance_distributes_equal_priority_candidates(self):
+        model = {
+            "tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
+            "status": "active", "routing": {"mode": "load_balance", "max_attempts": 2},
+        }
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "balanced", "provider": "provider-secondary", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-secondary-model",
+            "priority": 100, "status": "active",
+        }
+        try:
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [secondary]},
+                "load-balance-enable.json",
+            )
+            time.sleep(1.0)
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            for index in range(20):
+                port = self.gateway_port if index % 2 == 0 else self.gateway_secondary_port
+                status, _, body = self.request_at(
+                    port, "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": f"balanced-{index}"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                self.assertEqual(status, 200, body)
+            primary_count = len(self.provider_state.snapshot()[1])
+            secondary_count = len(self.provider_secondary_state.snapshot()[1])
+            self.assertGreater(primary_count, 0)
+            self.assertGreater(secondary_count, 0)
+            self.assertEqual(primary_count + secondary_count, 20)
+        finally:
+            model["routing"] = {"mode": "fixed_order", "max_attempts": 3}
+            secondary["status"] = "disabled"
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [secondary]},
+                "load-balance-disable.json",
+            )
+            time.sleep(1.0)
+
+    def test_phase4_candidate_identity_includes_the_model_mapping(self):
+        model = {
+            "tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
+            "status": "active", "routing": {"mode": "load_balance", "max_attempts": 2},
+        }
+        duplicate_target = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "duplicate-target", "provider": "provider-a", "endpoint": "responses",
+            "credential": "default", "upstream_model": "provider-model",
+            "priority": 100, "status": "active",
+        }
+        try:
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [duplicate_target]},
+                "candidate-identity-enable.json",
+            )
+            time.sleep(1.0)
+            subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "FLUSHDB"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            request_ids = []
+            for index in range(24):
+                status, headers, body = self.request(
+                    "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": f"candidate-{index}"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                self.assertEqual(status, 200, body)
+                request_ids.append(
+                    next(value for key, value in headers.items() if key.lower() == "x-request-id")
+                )
+            quoted_ids = ",".join(f"'{request_id}'" for request_id in request_ids)
+            selected_mappings = self.database_query(
+                "SELECT COUNT(DISTINCT mapping_id) FROM request_attempts "
+                f"WHERE request_id IN ({quoted_ids})"
+            ).strip()
+            self.assertEqual(selected_mappings, "2")
+        finally:
+            model["routing"] = {"mode": "fixed_order", "max_attempts": 3}
+            duplicate_target["status"] = "disabled"
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [duplicate_target]},
+                "candidate-identity-disable.json",
+            )
+            time.sleep(1.0)
+
+    def test_phase4_circuit_state_and_half_open_probe_are_shared(self):
+        model = {
+            "tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
+            "status": "active", "routing": {"mode": "fixed_order", "max_attempts": 2},
+        }
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "circuit-backup", "provider": "provider-secondary",
+            "endpoint": "responses", "credential": "default",
+            "upstream_model": "provider-secondary-model", "priority": 200,
+            "status": "active",
+        }
+        circuit_gateway = None
+        try:
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [secondary]},
+                "circuit-enable.json",
+            )
+            time.sleep(1.0)
+            subprocess.run(
+                ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "FLUSHDB"],
+                check=True, stdout=subprocess.DEVNULL,
+            )
+            circuit_port = free_port()
+            environment = self.gateway_environment(circuit_port)
+            environment.update({
+                "AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD": "3",
+                "AI_GATEWAY_CIRCUIT_OPEN_MS": "300",
+                "AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS": "1000",
+            })
+            circuit_gateway = subprocess.Popen(
+                [self.gateway_binary], env=environment,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.wait_for_gateway_port(circuit_port)
+
+            for index in range(3):
+                self.provider_state.reset("status500")
+                self.provider_secondary_state.reset()
+                status, _, body = self.request_at(
+                    circuit_port, "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": f"open-{index}"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )
+                self.assertEqual(status, 200, body)
+                self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+                self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            status, _, body = self.request_at(
+                self.gateway_secondary_port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "shared-open"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 0)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+
+            time.sleep(0.4)
+            self.provider_state.reset("slow_success")
+            self.provider_secondary_state.reset()
+            results = []
+            barrier = threading.Barrier(3)
+
+            def request_after_cooldown(port):
+                barrier.wait()
+                results.append(self.request_at(
+                    port, "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "half-open"}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=3,
+                ))
+
+            threads = [
+                threading.Thread(target=request_after_cooldown, args=(self.gateway_port,)),
+                threading.Thread(
+                    target=request_after_cooldown, args=(self.gateway_secondary_port,)
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(timeout=4)
+            self.assertEqual([result[0] for result in results], [200, 200])
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+        finally:
+            if circuit_gateway is not None:
+                circuit_gateway.terminate()
+                circuit_gateway.wait(timeout=5)
+            model["routing"] = {"mode": "fixed_order", "max_attempts": 3}
+            secondary["status"] = "disabled"
+            self.apply_config_patch(
+                {"logical_models": [model], "mappings": [secondary]},
+                "circuit-disable.json",
+            )
+            time.sleep(1.0)
 
     def test_upstream_statuses_are_sanitized(self):
         for scenario, expected_status, expected_code in [

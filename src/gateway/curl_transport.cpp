@@ -274,6 +274,19 @@ ProviderError classify_result(const CurlMultiProviderTransport::Task &task, CURL
     {
         return ProviderError::timeout;
     }
+    if (result == CURLE_COULDNT_RESOLVE_HOST || result == CURLE_COULDNT_RESOLVE_PROXY)
+    {
+        return ProviderError::dns_failure;
+    }
+    if (result == CURLE_COULDNT_CONNECT)
+    {
+        return ProviderError::connection_failure;
+    }
+    if (result == CURLE_SSL_CONNECT_ERROR || result == CURLE_PEER_FAILED_VERIFICATION ||
+        result == CURLE_SSL_CERTPROBLEM || result == CURLE_SSL_CIPHER)
+    {
+        return ProviderError::tls_failure;
+    }
     if (task.header_too_large || result != CURLE_OK)
     {
         return ProviderError::unavailable;
@@ -290,6 +303,11 @@ void complete_task(CURLM *multi,
     {
         curl_multi_remove_handle(multi, easy);
         curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &task->response.status);
+        curl_off_t uploaded = 0;
+        if (curl_easy_getinfo(easy, CURLINFO_SIZE_UPLOAD_T, &uploaded) == CURLE_OK)
+        {
+            task->response.request_may_have_been_sent = uploaded > 0;
+        }
     }
     task->response.error = error;
     curl_slist_free_all(task->headers);

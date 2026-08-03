@@ -1,6 +1,7 @@
 #include "gateway/runtime.hpp"
 
 #include <openssl/hmac.h>
+#include <openssl/sha.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -50,6 +51,18 @@ std::string hmac_key(const std::string &pepper, const std::string &key)
         throw std::runtime_error("API Key verification failed");
     }
     return std::string(reinterpret_cast<char *>(digest), digest_size);
+}
+
+std::string candidate_fingerprint(const RepositoryAccessRecord &record,
+                                  const RepositoryMapping &mapping)
+{
+    const std::string identity = std::to_string(record.config_version) + "\x1f" +
+        std::to_string(mapping.mapping_id) + "\x1f" + std::to_string(mapping.provider_id) +
+        "\x1f" + std::to_string(mapping.endpoint_id) + "\x1f" +
+        std::to_string(mapping.credential_id) + "\x1f" + mapping.upstream_model;
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char *>(identity.data()), identity.size(), digest);
+    return hex(digest, sizeof(digest));
 }
 
 bool constant_time_equal(std::string_view left, std::string_view right)
@@ -187,6 +200,8 @@ AuthResult build_result(const GatewayConfig &config,
 
     auto snapshot = std::make_shared<AuthSnapshot>();
     snapshot->config_version = matched->config_version;
+    snapshot->database_tenant_id = matched->database_tenant_id;
+    snapshot->database_api_key_id = matched->database_key_id;
     snapshot->tenant_slug = matched->tenant_slug;
     snapshot->public_api_key_id = matched->public_key_id;
     snapshot->protocols = matched->protocols;
@@ -194,8 +209,11 @@ AuthResult build_result(const GatewayConfig &config,
     for (const auto &model : matched->models)
     {
         ModelAccess access;
+        access.database_id = model.id;
         access.name = model.name;
         access.protocol = model.protocol;
+        access.scheduling_mode = model.scheduling_mode;
+        access.max_attempts = model.max_attempts;
         access.model_granted = model.granted && model.status == "active";
         auto inserted = snapshot->models.emplace(model.protocol + "\x1f" + model.name,
                                                  std::move(access));
@@ -227,8 +245,10 @@ AuthResult build_result(const GatewayConfig &config,
         try
         {
             model->second->candidates.push_back(
-                {mapping.endpoint_url, resolve_secret(config, mapping.secret_ref),
-                 mapping.upstream_model});
+                {mapping.mapping_id, mapping.provider_id, mapping.endpoint_id,
+                 mapping.credential_id, mapping.mapping_name, mapping.priority,
+                 candidate_fingerprint(*matched, mapping), mapping.endpoint_url,
+                 resolve_secret(config, mapping.secret_ref), mapping.upstream_model});
         }
         catch (const std::exception &)
         {
@@ -340,6 +360,73 @@ public:
         if (!accepted)
         {
             (*shared_callback)({AuthStatus::unavailable, {}});
+        }
+    }
+
+    void begin_attempt(AttemptStart attempt, AuditCallback callback)
+    {
+        auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
+        if (!enqueue([this, attempt = std::move(attempt), shared_callback] {
+                bool stored = false;
+                try
+                {
+                    repository_.begin_attempt(attempt);
+                    stored = true;
+                }
+                catch (...)
+                {
+                    fail_closed();
+                }
+                try
+                {
+                    (*shared_callback)(stored);
+                }
+                catch (...)
+                {
+                }
+            }))
+        {
+            fail_closed();
+            (*shared_callback)(false);
+        }
+    }
+
+    void finish_attempt(AttemptFinish attempt, AuditCallback callback)
+    {
+        auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
+        if (!enqueue([this, attempt = std::move(attempt), shared_callback] {
+                bool stored = false;
+                for (unsigned retry = 0; retry < 3 && !stored; ++retry)
+                {
+                    try
+                    {
+                        repository_.finish_attempt(attempt);
+                        stored = true;
+                    }
+                    catch (...)
+                    {
+                        if (retry + 1 < 3)
+                        {
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(25U << retry));
+                        }
+                    }
+                }
+                if (!stored)
+                {
+                    fail_closed();
+                }
+                try
+                {
+                    (*shared_callback)(stored);
+                }
+                catch (...)
+                {
+                }
+            }))
+        {
+            fail_closed();
+            (*shared_callback)(false);
         }
     }
 
@@ -523,6 +610,16 @@ RuntimeState::~RuntimeState() = default;
 void RuntimeState::authenticate(std::string api_key, AuthCallback callback)
 {
     impl_->authenticate(std::move(api_key), std::move(callback));
+}
+
+void RuntimeState::begin_attempt(AttemptStart attempt, AuditCallback callback)
+{
+    impl_->begin_attempt(std::move(attempt), std::move(callback));
+}
+
+void RuntimeState::finish_attempt(AttemptFinish attempt, AuditCallback callback)
+{
+    impl_->finish_attempt(std::move(attempt), std::move(callback));
 }
 
 bool RuntimeState::ready() const
