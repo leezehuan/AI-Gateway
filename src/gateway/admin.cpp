@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -197,6 +198,54 @@ void validate_secret_ref(const std::string &reference)
     {
         throw std::runtime_error("credential secret_ref must be env:NAME or file:basename");
     }
+}
+
+std::string normalize_expiry(std::string value);
+
+std::string optional_unsigned(const json &object, const char *field)
+{
+    if (!object.contains(field) || object[field].is_null())
+    {
+        return {};
+    }
+    if (!object[field].is_number_unsigned() &&
+        !(object[field].is_number_integer() && object[field].get<long long>() >= 0))
+    {
+        throw std::runtime_error(std::string("configuration field must be a non-negative integer: ") +
+                                 field);
+    }
+    return std::to_string(object[field].get<unsigned long long>());
+}
+
+std::uint64_t usd_microunits(const std::string &value, const std::string &field)
+{
+    static const std::regex pattern("^([0-9]{1,12})(?:\\.([0-9]{1,6}))?$");
+    std::smatch match;
+    if (!std::regex_match(value, match, pattern))
+    {
+        throw std::runtime_error(field + " must be a non-negative USD decimal string");
+    }
+    std::string fraction = match[2].matched ? match[2].str() : std::string();
+    fraction.append(6 - fraction.size(), '0');
+    const unsigned long long whole = std::stoull(match[1].str());
+    if (whole > (std::numeric_limits<std::uint64_t>::max() - 999999ULL) / 1000000ULL)
+    {
+        throw std::runtime_error(field + " is too large");
+    }
+    return whole * 1000000ULL + (fraction.empty() ? 0ULL : std::stoull(fraction));
+}
+
+std::string optional_money(const json &object, const char *field)
+{
+    if (!object.contains(field) || object[field].is_null())
+    {
+        return {};
+    }
+    if (!object[field].is_string())
+    {
+        throw std::runtime_error(std::string(field) + " must be a USD decimal string");
+    }
+    return std::to_string(usd_microunits(object[field].get<std::string>(), field));
 }
 
 const json &required(const json &object, const char *field, json::value_t type)
@@ -395,6 +444,105 @@ void apply_config(MySqlConnection &connection, const json &root)
         }
     }
 
+    for (const auto &quota : array_or_empty(root, "quota_policies"))
+    {
+        const std::string tenant_slug = required_string(quota, "tenant");
+        const std::string slug = required_string(quota, "slug");
+        validate_name(slug, "Quota Policy slug");
+        const auto tenant_id = require_id(connection,
+            "SELECT id FROM tenants WHERE slug=?", {tenant_slug}, tenant_slug);
+        const std::string rpm = optional_unsigned(quota, "rpm");
+        const std::string concurrency = optional_unsigned(quota, "concurrency");
+        const std::string daily = optional_money(quota, "daily_budget_usd");
+        const std::string monthly = optional_money(quota, "monthly_budget_usd");
+        const std::string reservation = quota.contains("reservation_per_attempt_usd")
+                                            ? optional_money(quota, "reservation_per_attempt_usd")
+                                            : "0";
+        if ((!daily.empty() || !monthly.empty()) &&
+            (reservation.empty() || reservation == "0"))
+        {
+            throw std::runtime_error(
+                "budgeted Quota Policy requires reservation_per_attempt_usd");
+        }
+        upsert(connection,
+            "INSERT INTO quota_policies(tenant_id, slug, name, status, rpm_limit, "
+            "concurrency_limit, daily_budget_microusd, monthly_budget_microusd, "
+            "reservation_per_attempt_microusd) VALUES (?, ?, ?, ?, NULLIF(?, ''), "
+            "NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) "
+            "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), name=VALUES(name), "
+            "status=VALUES(status), rpm_limit=VALUES(rpm_limit), "
+            "concurrency_limit=VALUES(concurrency_limit), "
+            "daily_budget_microusd=VALUES(daily_budget_microusd), "
+            "monthly_budget_microusd=VALUES(monthly_budget_microusd), "
+            "reservation_per_attempt_microusd=VALUES(reservation_per_attempt_microusd)",
+            {std::to_string(tenant_id), slug, required_string(quota, "name"), status_of(quota),
+             rpm, concurrency, daily, monthly, reservation}, changed);
+    }
+
+    for (const auto &tenant : array_or_empty(root, "tenants"))
+    {
+        if (!tenant.contains("quota_policy"))
+        {
+            continue;
+        }
+        const std::string tenant_slug = required_string(tenant, "slug");
+        const auto tenant_id = require_id(connection,
+            "SELECT id FROM tenants WHERE slug=?", {tenant_slug}, tenant_slug);
+        std::string quota_id;
+        if (!tenant["quota_policy"].is_null())
+        {
+            if (!tenant["quota_policy"].is_string())
+            {
+                throw std::runtime_error("Tenant quota_policy must be a string or null");
+            }
+            quota_id = std::to_string(require_id(connection,
+                "SELECT id FROM quota_policies WHERE tenant_id=? AND slug=?",
+                {std::to_string(tenant_id), tenant["quota_policy"].get<std::string>()},
+                "Quota Policy"));
+        }
+        changed = connection.execute_prepared(
+            "UPDATE tenants SET quota_policy_id=NULLIF(?, '') WHERE id=? AND "
+            "NOT (quota_policy_id <=> NULLIF(?, ''))",
+            {quota_id, std::to_string(tenant_id), quota_id}) != 0 || changed;
+    }
+
+    for (const auto &provider : array_or_empty(root, "providers"))
+    {
+        const std::string tenant_slug = required_string(provider, "tenant");
+        const auto tenant_id = require_id(connection,
+            "SELECT id FROM tenants WHERE slug=?", {tenant_slug}, tenant_slug);
+        const auto provider_id = require_id(connection,
+            "SELECT p.id FROM providers p WHERE p.tenant_id=? AND p.slug=?",
+            {std::to_string(tenant_id), required_string(provider, "slug")}, "Provider");
+        for (const auto &credential : array_or_empty(provider, "credentials"))
+        {
+            if (!credential.contains("quota_policy"))
+            {
+                continue;
+            }
+            std::string quota_id;
+            if (!credential["quota_policy"].is_null())
+            {
+                if (!credential["quota_policy"].is_string())
+                {
+                    throw std::runtime_error("Credential quota_policy must be a string or null");
+                }
+                quota_id = std::to_string(require_id(connection,
+                    "SELECT id FROM quota_policies WHERE tenant_id=? AND slug=?",
+                    {std::to_string(tenant_id), credential["quota_policy"].get<std::string>()},
+                    "Quota Policy"));
+            }
+            const auto credential_id = require_id(connection,
+                "SELECT id FROM provider_credentials WHERE provider_id=? AND name=?",
+                {std::to_string(provider_id), required_string(credential, "name")},
+                "Provider Credential");
+            changed = connection.execute_prepared(
+                "UPDATE provider_credentials SET quota_policy_id=NULLIF(?, '') WHERE id=? AND "
+                "NOT (quota_policy_id <=> NULLIF(?, ''))",
+                {quota_id, std::to_string(credential_id), quota_id}) != 0 || changed;
+        }
+    }
+
     for (const auto &model : array_or_empty(root, "logical_models"))
     {
         const std::string tenant_slug = required_string(model, "tenant");
@@ -555,6 +703,104 @@ void apply_config(MySqlConnection &connection, const json &root)
              std::to_string(priority), status_of(mapping)}, changed);
     }
 
+    for (const auto &price : array_or_empty(root, "model_prices"))
+    {
+        const std::string tenant_slug = required_string(price, "tenant");
+        const auto tenant_id = require_id(connection,
+            "SELECT id FROM tenants WHERE slug=?", {tenant_slug}, tenant_slug);
+        const auto provider_id = require_id(connection,
+            "SELECT id FROM providers WHERE tenant_id=? AND slug=?",
+            {std::to_string(tenant_id), required_string(price, "provider")}, "Provider");
+        const std::string upstream_model = required_string(price, "upstream_model");
+        const std::string version = required_string(price, "version");
+        validate_name(upstream_model, "upstream model");
+        validate_name(version, "price version");
+        const std::string effective_at = normalize_expiry(required_string(price, "effective_at"));
+        const std::string input = std::to_string(usd_microunits(
+            required_string(price, "input_per_million_usd"), "input_per_million_usd"));
+        const std::string cached = std::to_string(usd_microunits(
+            required_string(price, "cached_input_per_million_usd"),
+            "cached_input_per_million_usd"));
+        const std::string output = std::to_string(usd_microunits(
+            required_string(price, "output_per_million_usd"), "output_per_million_usd"));
+        const std::string status = status_of(price);
+        const auto existing = connection.query_prepared(
+            "SELECT id, effective_at <=> ?, input_per_million_microusd=?, "
+            "cached_input_per_million_microusd=?, output_per_million_microusd=?, status "
+            "FROM model_prices WHERE provider_id=? AND upstream_model=? AND version=?",
+            {effective_at, input, cached, output, std::to_string(provider_id), upstream_model,
+             version});
+        if (existing.empty())
+        {
+            upsert(connection,
+                "INSERT INTO model_prices(provider_id, upstream_model, version, effective_at, "
+                "input_per_million_microusd, cached_input_per_million_microusd, "
+                "output_per_million_microusd, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                {std::to_string(provider_id), upstream_model, version, effective_at, input, cached,
+                 output, status}, changed);
+        }
+        else
+        {
+            if (existing.size() != 1 || existing.front().size() != 6 ||
+                existing.front()[1] != "1" || existing.front()[2] != "1" ||
+                existing.front()[3] != "1" || existing.front()[4] != "1")
+            {
+                throw std::runtime_error("model price versions are immutable");
+            }
+            if (existing.front()[5] != status)
+            {
+                changed = connection.execute_prepared(
+                    "UPDATE model_prices SET status=? WHERE id=?",
+                    {status, existing.front()[0]}) != 0 || changed;
+            }
+        }
+    }
+
+    for (const auto &probe : array_or_empty(root, "health_checks"))
+    {
+        const std::string tenant_slug = required_string(probe, "tenant");
+        const auto tenant_id = require_id(connection,
+            "SELECT id FROM tenants WHERE slug=?", {tenant_slug}, tenant_slug);
+        const auto provider_id = require_id(connection,
+            "SELECT id FROM providers WHERE tenant_id=? AND slug=?",
+            {std::to_string(tenant_id), required_string(probe, "provider")}, "Provider");
+        const auto endpoint_id = require_id(connection,
+            "SELECT id FROM provider_endpoints WHERE provider_id=? AND name=?",
+            {std::to_string(provider_id), required_string(probe, "endpoint")},
+            "Provider Endpoint");
+        const auto credential_id = require_id(connection,
+            "SELECT id FROM provider_credentials WHERE provider_id=? AND name=?",
+            {std::to_string(provider_id), required_string(probe, "credential")},
+            "Provider Credential");
+        const std::string name = required_string(probe, "name");
+        const std::string method = probe.value("method", "GET");
+        const std::string url = required_string(probe, "url");
+        validate_name(name, "Health Check name");
+        validate_url(url);
+        if (method != "GET" && method != "HEAD")
+        {
+            throw std::runtime_error("Health Check method must be GET or HEAD");
+        }
+        const std::string interval = optional_unsigned(probe, "interval_ms").empty()
+                                         ? "30000" : optional_unsigned(probe, "interval_ms");
+        const std::string timeout = optional_unsigned(probe, "timeout_ms").empty()
+                                        ? "2000" : optional_unsigned(probe, "timeout_ms");
+        if (std::stoull(interval) < 1000 || std::stoull(interval) > 3600000 ||
+            std::stoull(timeout) < 100 || std::stoull(timeout) > 60000)
+        {
+            throw std::runtime_error("Health Check interval or timeout is out of range");
+        }
+        upsert(connection,
+            "INSERT INTO provider_health_checks(provider_id, endpoint_id, credential_id, name, "
+            "method, url, interval_ms, timeout_ms, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), endpoint_id=VALUES(endpoint_id), "
+            "credential_id=VALUES(credential_id), method=VALUES(method), url=VALUES(url), "
+            "interval_ms=VALUES(interval_ms), timeout_ms=VALUES(timeout_ms), status=VALUES(status)",
+            {std::to_string(provider_id), std::to_string(endpoint_id),
+             std::to_string(credential_id), name, method, url, interval, timeout,
+             status_of(probe)}, changed);
+    }
+
     if (changed)
     {
         bump_version(connection);
@@ -626,7 +872,8 @@ IssuedKey issue_key(MySqlConnection &connection,
                     const std::string &tenant_slug,
                     const std::string &policy_slug,
                     const std::string &name,
-                    const std::string &expires_at)
+                    const std::string &expires_at,
+                    const std::string &quota_slug)
 {
     const auto rows = connection.query_prepared(
         "SELECT t.id, p.id FROM tenants t JOIN access_policies p ON p.tenant_id=t.id "
@@ -635,6 +882,13 @@ IssuedKey issue_key(MySqlConnection &connection,
     if (rows.size() != 1)
     {
         throw std::runtime_error("unknown Tenant or Access Policy");
+    }
+    std::string quota_id;
+    if (!quota_slug.empty())
+    {
+        quota_id = std::to_string(require_id(connection,
+            "SELECT id FROM quota_policies WHERE tenant_id=? AND slug=?",
+            {rows[0][0], quota_slug}, "Quota Policy"));
     }
     const auto prefix_bytes = random_bytes(9);
     const auto secret_bytes = random_bytes(32);
@@ -656,12 +910,42 @@ IssuedKey issue_key(MySqlConnection &connection,
 
     Transaction transaction(connection);
     connection.execute_prepared(
-        "INSERT INTO api_keys(key_id, tenant_id, policy_id, name, display_prefix, key_hmac, "
-        "status, expires_at) VALUES (?, ?, ?, ?, ?, ?, 'active', NULLIF(?, ''))",
-        {key_id, rows[0][0], rows[0][1], name, prefix, binary_digest, expires_at});
+        "INSERT INTO api_keys(key_id, tenant_id, policy_id, quota_policy_id, name, display_prefix, "
+        "key_hmac, status, expires_at) VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?, 'active', "
+        "NULLIF(?, ''))",
+        {key_id, rows[0][0], rows[0][1], quota_id, name, prefix, binary_digest, expires_at});
     bump_version(connection);
     transaction.commit();
     return {key, key_id};
+}
+
+void set_key_quota(MySqlConnection &connection,
+                   const std::string &key_id,
+                   const std::string &quota_slug)
+{
+    const auto key = connection.query_prepared(
+        "SELECT tenant_id, quota_policy_id FROM api_keys WHERE key_id=?", {key_id});
+    if (key.size() != 1)
+    {
+        throw std::runtime_error("unknown API Key ID");
+    }
+    std::string quota_id;
+    if (quota_slug != "none")
+    {
+        quota_id = std::to_string(require_id(connection,
+            "SELECT id FROM quota_policies WHERE tenant_id=? AND slug=?",
+            {key.front()[0], quota_slug}, "Quota Policy"));
+    }
+    Transaction transaction(connection);
+    const auto changed = connection.execute_prepared(
+        "UPDATE api_keys SET quota_policy_id=NULLIF(?, '') WHERE key_id=? AND "
+        "NOT (quota_policy_id <=> NULLIF(?, ''))",
+        {quota_id, key_id, quota_id});
+    if (changed != 0)
+    {
+        bump_version(connection);
+    }
+    transaction.commit();
 }
 
 void set_key_status(MySqlConnection &connection,
@@ -723,10 +1007,12 @@ int main(int argc, char **argv)
                     "AI_GATEWAY_API_KEY_HMAC_PEPPER must contain at least 32 bytes");
             }
             const auto expiry = options.find("--expires-at");
+            const auto quota = options.find("--quota");
             const IssuedKey issued = issue_key(
                 connection, config, require_option(options, "--tenant"),
                 require_option(options, "--policy"), require_option(options, "--name"),
-                normalize_expiry(expiry == options.end() ? std::string() : expiry->second));
+                normalize_expiry(expiry == options.end() ? std::string() : expiry->second),
+                quota == options.end() ? std::string() : quota->second);
             std::cerr << "Issued API Key ID: " << issued.public_id << '\n';
             std::cout << issued.key << '\n';
         }
@@ -734,6 +1020,11 @@ int main(int argc, char **argv)
         {
             set_key_status(connection, require_option(options, "--key-id"),
                            require_option(options, "--status"));
+        }
+        else if (command == "set-key-quota")
+        {
+            set_key_quota(connection, require_option(options, "--key-id"),
+                          require_option(options, "--quota"));
         }
         else if (command == "bump-version")
         {

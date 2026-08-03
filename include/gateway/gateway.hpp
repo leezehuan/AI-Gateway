@@ -19,6 +19,8 @@ namespace ai_gateway
 {
 class RuntimeState;
 class RoutingRuntime;
+class GovernanceRuntime;
+class MetricsRegistry;
 struct AuthSnapshot;
 using HeaderMap = std::unordered_map<std::string, std::string>;
 
@@ -108,6 +110,8 @@ struct GatewayConfig
     unsigned circuit_failure_threshold = 3;
     long circuit_open_ms = 30000;
     long circuit_probe_lease_ms = 10000;
+    long governance_lease_ttl_ms = 120000;
+    long governance_lease_renew_ms = 30000;
 
     static GatewayConfig from_env();
     void validate() const;
@@ -115,6 +119,7 @@ struct GatewayConfig
 
 struct ProviderRequest
 {
+    std::string method = "POST";
     std::string url;
     HeaderMap headers;
     std::string body;
@@ -146,6 +151,12 @@ struct ProviderResponse
     HeaderMap headers;
     std::string body;
     bool request_may_have_been_sent = false;
+    bool has_first_byte_timing = false;
+    std::uint64_t dns_ms = 0;
+    std::uint64_t connect_ms = 0;
+    std::uint64_t tls_ms = 0;
+    std::uint64_t first_byte_ms = 0;
+    std::uint64_t total_ms = 0;
 };
 
 struct ProviderResponseHead
@@ -189,7 +200,11 @@ public:
 class AiGateway
 {
 public:
-    AiGateway(RuntimeState &runtime, RoutingRuntime &routing, ProviderTransport &transport);
+    AiGateway(RuntimeState &runtime,
+              RoutingRuntime &routing,
+              GovernanceRuntime &governance,
+              MetricsRegistry &metrics,
+              ProviderTransport &transport);
 
     void handle(const GatewayRequest &request,
                 ResponseWriter &response,
@@ -205,6 +220,8 @@ private:
 
     RuntimeState &runtime_;
     RoutingRuntime &routing_;
+    GovernanceRuntime &governance_;
+    MetricsRegistry &metrics_;
     ProviderTransport &transport_;
 };
 

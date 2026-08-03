@@ -1,29 +1,32 @@
 # Cluster-Chat-Server
 
-> Migration status: Phase 0 through Phase 4 add an independent C++ AI API gateway while the legacy
+> Migration status: Phase 0 through Phase 5 add an independent C++ AI API gateway while the legacy
 > chat server remains available as a rollback target. See
 > [`ai-api-gateway-migration-spec.md`](ai-api-gateway-migration-spec.md).
 
-## AI Gateway (Phase 4)
+## AI Gateway (Phase 5)
 
-`AiGateway` exposes `GET /healthz`, `GET /readyz`, `GET /v1/models`, and streaming or non-streaming
-`POST /v1/responses`. It uses asynchronous Boost.Beast/Asio for ingress and one process-wide
+`AiGateway` exposes `GET /healthz`, `GET /readyz`, internal `GET /metrics`, authenticated
+`GET /v1/models`, and streaming or non-streaming `POST /v1/responses`. It uses asynchronous
+Boost.Beast/Asio for ingress and one process-wide
 libcurl multi transport for upstream requests. SSE responses are incrementally validated and
 relayed with bounded buffering, high/low-water backpressure, upstream cancellation on client
 disconnect, and separate first-event, idle, and maximum-duration timeouts.
 
-MySQL stores Tenant identity, HMAC-only API Keys, reusable Access Policies, Provider resources,
-Tenant-scoped Logical Models, Route Policies, and one audit row per Provider Attempt. Blocking SQL
-is isolated on a fixed worker pool. Redis shares session affinity, Candidate health, circuit state,
-and half-open probe leases across Gateway nodes. New proxy requests fail closed when either runtime
-store is unavailable; `/healthz` remains available, and `/v1/models` does not depend on Redis.
+MySQL stores Tenant identity, HMAC-only API Keys, reusable Access and Quota Policies, Provider
+resources, Tenant-scoped Logical Models, Route Policies, immutable Model Prices, one audit row per
+Provider Attempt, one Usage terminal per admitted request, and UTC budget reservations. Blocking
+SQL is isolated on a fixed worker pool. Redis shares rolling RPM, renewable concurrency leases,
+session affinity, Candidate health, circuit state, and probe leases across Gateway nodes. New proxy
+requests fail closed when either governance store is unavailable; `/healthz` remains available,
+and `/v1/models` does not consume quota or depend on Redis.
 
 Each Candidate is attempted at most once. Retryable pre-commit failures may move to another
 Candidate, up to the Route Policy limit; an SSE failure after the first business event never fails
 over. Provider secrets are resolved from `env:NAME` or a non-symlink `file:basename` below
 `AI_GATEWAY_SECRET_DIR`. API Keys, Provider secrets, URLs, affinity values, Prompts, and response
-bodies are excluded from runtime stores and logs. Quota, Usage, pricing, budgets, and Prometheus
-remain out of scope.
+bodies are excluded from runtime stores, logs, and metric labels. Exact Provider Usage is priced
+with integer micro-USD arithmetic; missing Usage or prices remain explicitly estimated or unknown.
 
 Configure the Gateway DB and HMAC pepper values in `.env`, then build:
 
@@ -46,6 +49,8 @@ BUILD_DIR=build/gateway ./scripts/run-gateway.sh
 ```
 
 Use `AiGatewayAdmin set-key-status --key-id <public-id> --status disabled` to revoke a Key, and
+`AiGatewayAdmin set-key-quota --key-id <public-id> --quota <slug|none>` to change its Quota Policy.
+`issue-key` accepts `--quota <slug>`. Use
 `AiGatewayAdmin bump-version` after rotating a `file:` Secret. Environment Secret rotation requires
 a Gateway restart. `apply-config` upserts supplied resources without deleting omitted resources;
 an effective change increments the configuration version once.
@@ -96,11 +101,29 @@ The shared routing controls use these defaults:
 | `AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD` | `3` | Consecutive failures before opening |
 | `AI_GATEWAY_CIRCUIT_OPEN_MS` | `30000` | Default open-circuit cooldown |
 | `AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS` | `10000` | Single half-open probe lease |
+| `AI_GATEWAY_GOVERNANCE_LEASE_TTL_MS` | `120000` | Distributed concurrency lease lifetime |
+| `AI_GATEWAY_GOVERNANCE_LEASE_RENEW_MS` | `30000` | Active lease renewal interval |
 
 `AI_GATEWAY_REDIS_USERNAME` and `AI_GATEWAY_REDIS_PASSWORD` are optional. Route modes are
 `fixed_order`, `load_balance`, and `cache_affinity`; old Logical Models without an explicit Route
 Policy use `fixed_order` with at most three Attempts. Mapping priority defaults to `100`, and lower
 values are preferred.
+
+Quota Policies can independently bind to a Tenant, API Key, or Provider Credential. Tenant and API
+Key RPM count once per client request; Credential RPM counts each real Provider Attempt, including
+explicit health probes. Budgets reserve `reservation_per_attempt * max_attempts` before routing and
+settle against exact cost when possible. The renewal interval must be less than half the lease TTL.
+Expired MySQL reservations are released by the background coordinator and retain an
+`abandoned/unknown` Usage terminal.
+
+Provider health checks are disabled unless an administrator supplies a `health_checks` entry via
+`apply-config`. They must use an explicit GET or HEAD URL. Across nodes, only one probe runs for a
+target per configured interval; it consumes Credential quota but does not create Usage or Attempt
+rows. Three consecutive failures exclude the Candidate, and one success restores it.
+
+Prometheus should scrape `http://<gateway-internal-address>/metrics` directly. The supplied public
+Nginx example returns `404` for that path so metric dimensions are not exposed through the client
+proxy.
 
 The stream controls use these defaults:
 
@@ -138,6 +161,8 @@ upstream catalog changes. The Provider model catalog does not itself guarantee t
 model accepts the Responses protocol; validate models used by production policies. Lingsuan
 currently terminates successful streams with `response.completed` and no `[DONE]` sentinel; the
 Gateway accepts and forwards that valid terminal form.
+No price or active health-check URL is invented for Lingsuan; add either only from operator-verified
+terms and an explicitly non-billable endpoint.
 
 Apply the configuration and issue a Tenant Key with the existing Gateway DB environment loaded:
 
@@ -150,7 +175,8 @@ AI_GATEWAY_API_KEY="$(build/gateway/bin/AiGatewayAdmin issue-key \
 After starting `AiGateway` with `LINGSUAN_API_KEY` and Nginx with the provided HTTP proxy example,
 run the explicit live check below. It makes billable non-streaming and streaming requests through
 Nginx; `gpt-5.6-terra` is the default and can be overridden with
-`AI_GATEWAY_LIVE_TEST_MODEL`.
+`AI_GATEWAY_LIVE_TEST_MODEL`. The optional CTest live case additionally requires the explicit
+`AI_GATEWAY_RUN_LIVE_TESTS=1` gate.
 
 ```shell
 AI_GATEWAY_API_KEY="${AI_GATEWAY_API_KEY}" \

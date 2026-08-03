@@ -24,7 +24,7 @@ endif()
 find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
 find_library(HIREDIS_LIBRARY NAMES hiredis)
 if(NOT HIREDIS_INCLUDE_DIR OR NOT HIREDIS_LIBRARY)
-    message(FATAL_ERROR "hiredis development files are required for AiGateway Phase 4")
+    message(FATAL_ERROR "hiredis development files are required for AiGateway Phase 5")
 endif()
 if(NOT MARIADB_INCLUDE_DIR OR NOT MARIADB_LIBRARY)
     message(FATAL_ERROR "MariaDB Connector/C development files are required for AiGateway")
@@ -36,6 +36,9 @@ add_library(ai_gateway_runtime STATIC
     repository.cpp
     runtime.cpp
     routing.cpp
+    governance.cpp
+    metrics.cpp
+    health.cpp
 )
 target_include_directories(ai_gateway_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include

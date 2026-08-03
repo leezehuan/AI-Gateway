@@ -308,6 +308,18 @@ void complete_task(CURLM *multi,
         {
             task->response.request_may_have_been_sent = uploaded > 0;
         }
+        const auto timing_ms = [easy](CURLINFO info) {
+            double seconds = 0;
+            return curl_easy_getinfo(easy, info, &seconds) == CURLE_OK
+                       ? static_cast<std::uint64_t>(std::max(0.0, seconds) * 1000.0)
+                       : 0;
+        };
+        task->response.dns_ms = timing_ms(CURLINFO_NAMELOOKUP_TIME);
+        task->response.connect_ms = timing_ms(CURLINFO_CONNECT_TIME);
+        task->response.tls_ms = timing_ms(CURLINFO_APPCONNECT_TIME);
+        task->response.first_byte_ms = timing_ms(CURLINFO_STARTTRANSFER_TIME);
+        task->response.total_ms = timing_ms(CURLINFO_TOTAL_TIME);
+        task->response.has_first_byte_timing = task->first_body_byte;
     }
     task->response.error = error;
     curl_slist_free_all(task->headers);
@@ -447,10 +459,21 @@ void CurlMultiProviderTransport::run()
             }
 
             curl_easy_setopt(easy, CURLOPT_URL, task->request.url.c_str());
-            curl_easy_setopt(easy, CURLOPT_POST, 1L);
-            curl_easy_setopt(easy, CURLOPT_POSTFIELDS, task->request.body.data());
-            curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE_LARGE,
-                             static_cast<curl_off_t>(task->request.body.size()));
+            if (task->request.method == "POST")
+            {
+                curl_easy_setopt(easy, CURLOPT_POST, 1L);
+                curl_easy_setopt(easy, CURLOPT_POSTFIELDS, task->request.body.data());
+                curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE_LARGE,
+                                 static_cast<curl_off_t>(task->request.body.size()));
+            }
+            else if (task->request.method == "HEAD")
+            {
+                curl_easy_setopt(easy, CURLOPT_NOBODY, 1L);
+            }
+            else
+            {
+                curl_easy_setopt(easy, CURLOPT_HTTPGET, 1L);
+            }
             curl_easy_setopt(easy, CURLOPT_HTTPHEADER, task->headers);
             curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
             curl_easy_setopt(easy, CURLOPT_WRITEDATA, task.get());

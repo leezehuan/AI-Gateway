@@ -53,16 +53,22 @@ std::string hmac_key(const std::string &pepper, const std::string &key)
     return std::string(reinterpret_cast<char *>(digest), digest_size);
 }
 
-std::string candidate_fingerprint(const RepositoryAccessRecord &record,
+std::string candidate_fingerprint(std::uint64_t config_version,
                                   const RepositoryMapping &mapping)
 {
-    const std::string identity = std::to_string(record.config_version) + "\x1f" +
+    const std::string identity = std::to_string(config_version) + "\x1f" +
         std::to_string(mapping.mapping_id) + "\x1f" + std::to_string(mapping.provider_id) +
         "\x1f" + std::to_string(mapping.endpoint_id) + "\x1f" +
         std::to_string(mapping.credential_id) + "\x1f" + mapping.upstream_model;
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char *>(identity.data()), identity.size(), digest);
     return hex(digest, sizeof(digest));
+}
+
+std::string candidate_fingerprint(const RepositoryAccessRecord &record,
+                                  const RepositoryMapping &mapping)
+{
+    return candidate_fingerprint(record.config_version, mapping);
 }
 
 bool constant_time_equal(std::string_view left, std::string_view right)
@@ -193,7 +199,9 @@ AuthResult build_result(const GatewayConfig &config,
     {
         return {AuthStatus::invalid_api_key, {}};
     }
-    if (matched->tenant_status != "active" || matched->policy_status != "active")
+    if (matched->tenant_status != "active" || matched->policy_status != "active" ||
+        (matched->tenant_quota && matched->tenant_quota->status != "active") ||
+        (matched->api_key_quota && matched->api_key_quota->status != "active"))
     {
         return {AuthStatus::access_disabled, {}};
     }
@@ -204,6 +212,8 @@ AuthResult build_result(const GatewayConfig &config,
     snapshot->database_api_key_id = matched->database_key_id;
     snapshot->tenant_slug = matched->tenant_slug;
     snapshot->public_api_key_id = matched->public_key_id;
+    snapshot->tenant_quota = matched->tenant_quota;
+    snapshot->api_key_quota = matched->api_key_quota;
     snapshot->protocols = matched->protocols;
     std::unordered_map<std::uint64_t, ModelAccess *> by_id;
     for (const auto &model : matched->models)
@@ -242,13 +252,40 @@ AuthResult build_result(const GatewayConfig &config,
             model->second->configuration_unavailable = true;
             continue;
         }
+        if (mapping.credential_quota && mapping.credential_quota->status != "active")
+        {
+            model->second->configuration_unavailable = true;
+            continue;
+        }
         try
         {
-            model->second->candidates.push_back(
-                {mapping.mapping_id, mapping.provider_id, mapping.endpoint_id,
-                 mapping.credential_id, mapping.mapping_name, mapping.priority,
-                 candidate_fingerprint(*matched, mapping), mapping.endpoint_url,
-                 resolve_secret(config, mapping.secret_ref), mapping.upstream_model});
+            ModelTarget target;
+            target.mapping_id = mapping.mapping_id;
+            target.provider_id = mapping.provider_id;
+            target.endpoint_id = mapping.endpoint_id;
+            target.credential_id = mapping.credential_id;
+            target.mapping_name = mapping.mapping_name;
+            target.priority = mapping.priority;
+            target.fingerprint = candidate_fingerprint(*matched, mapping);
+            target.provider_url = mapping.endpoint_url;
+            target.provider_api_key = resolve_secret(config, mapping.secret_ref);
+            target.upstream_model = mapping.upstream_model;
+            target.provider_slug = mapping.provider_slug;
+            target.credential_name = mapping.credential_name;
+            target.credential_quota = mapping.credential_quota;
+            for (const auto &price : matched->prices)
+            {
+                if (price.provider_id == mapping.provider_id &&
+                    price.upstream_model == mapping.upstream_model)
+                {
+                    target.prices.push_back(
+                        {price.id, price.version, price.effective_at_epoch,
+                         price.input_per_million_microusd,
+                         price.cached_input_per_million_microusd,
+                         price.output_per_million_microusd});
+                }
+            }
+            model->second->candidates.push_back(std::move(target));
         }
         catch (const std::exception &)
         {
@@ -391,6 +428,101 @@ public:
         }
     }
 
+    void admit_request(RequestAdmission request, AdmissionCallback callback)
+    {
+        auto shared_callback = std::make_shared<AdmissionCallback>(std::move(callback));
+        if (!enqueue([this, request = std::move(request), shared_callback] {
+                try
+                {
+                    (*shared_callback)(repository_.admit_request(request));
+                }
+                catch (...)
+                {
+                    fail_closed();
+                    (*shared_callback)(RequestAdmissionStatus::unavailable);
+                }
+            }))
+        {
+            fail_closed();
+            (*shared_callback)(RequestAdmissionStatus::unavailable);
+        }
+    }
+
+    void finish_request(RequestFinish request, AuditCallback callback)
+    {
+        auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
+        if (!enqueue([this, request = std::move(request), shared_callback] {
+                bool stored = false;
+                for (unsigned retry = 0; retry < 3 && !stored; ++retry)
+                {
+                    try
+                    {
+                        repository_.finish_request(request);
+                        stored = true;
+                    }
+                    catch (...)
+                    {
+                        if (retry + 1 < 3)
+                        {
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(25U << retry));
+                        }
+                    }
+                }
+                if (!stored)
+                {
+                    fail_closed();
+                }
+                (*shared_callback)(stored);
+            }))
+        {
+            fail_closed();
+            (*shared_callback)(false);
+        }
+    }
+
+    void load_health_checks(HealthCheckCallback callback)
+    {
+        auto shared_callback = std::make_shared<HealthCheckCallback>(std::move(callback));
+        if (!enqueue([this, shared_callback] {
+                HealthCheckResult result;
+                try
+                {
+                    for (const auto &record : repository_.load_health_checks())
+                    {
+                        HealthCheckTarget target;
+                        target.id = record.id;
+                        target.config_version = record.config_version;
+                        target.credential_id = record.credential_id;
+                        target.provider_slug = record.provider_slug;
+                        target.credential_name = record.credential_name;
+                        target.method = record.method;
+                        target.url = record.url;
+                        target.provider_api_key = resolve_secret(config_, record.secret_ref);
+                        target.interval_ms = record.interval_ms;
+                        target.timeout_ms = record.timeout_ms;
+                        target.credential_quota = record.credential_quota;
+                        for (const auto &mapping : record.mappings)
+                        {
+                            target.candidate_fingerprints.push_back(
+                                candidate_fingerprint(record.config_version, mapping));
+                        }
+                        result.targets.push_back(std::move(target));
+                    }
+                    result.available = true;
+                }
+                catch (...)
+                {
+                    fail_closed();
+                }
+                (*shared_callback)(std::move(result));
+            }))
+        {
+            fail_closed();
+            (*shared_callback)({});
+        }
+    }
+
     void finish_attempt(AttemptFinish attempt, AuditCallback callback)
     {
         auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
@@ -507,6 +639,7 @@ private:
         if (!enqueue([this] {
                 try
                 {
+                    repository_.reconcile_abandoned_requests();
                     apply_version(repository_.config_version());
                     ready_.store(true);
                 }
@@ -615,6 +748,21 @@ void RuntimeState::authenticate(std::string api_key, AuthCallback callback)
 void RuntimeState::begin_attempt(AttemptStart attempt, AuditCallback callback)
 {
     impl_->begin_attempt(std::move(attempt), std::move(callback));
+}
+
+void RuntimeState::admit_request(RequestAdmission request, AdmissionCallback callback)
+{
+    impl_->admit_request(std::move(request), std::move(callback));
+}
+
+void RuntimeState::finish_request(RequestFinish request, AuditCallback callback)
+{
+    impl_->finish_request(std::move(request), std::move(callback));
+}
+
+void RuntimeState::load_health_checks(HealthCheckCallback callback)
+{
+    impl_->load_health_checks(std::move(callback));
 }
 
 void RuntimeState::finish_attempt(AttemptFinish attempt, AuditCallback callback)

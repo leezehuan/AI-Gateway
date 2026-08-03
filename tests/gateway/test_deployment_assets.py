@@ -46,6 +46,9 @@ class DeploymentAssetsTest(unittest.TestCase):
         )
         cls.live_test_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.live_test_module)
+        cls.nginx_config = (
+            cls.repo / "deploy" / "nginx" / "ai-gateway.conf.example"
+        ).read_text(encoding="utf-8")
 
     def test_lingsuan_provider_uses_responses_endpoint_and_environment_secret(self):
         provider = self.config["providers"][0]
@@ -81,6 +84,10 @@ class DeploymentAssetsTest(unittest.TestCase):
             ),
             ("response.completed", True, False),
         )
+
+    def test_public_nginx_proxy_does_not_expose_metrics(self):
+        self.assertIn("location = /metrics", self.nginx_config)
+        self.assertIn("return 404", self.nginx_config)
 
 
 if __name__ == "__main__":

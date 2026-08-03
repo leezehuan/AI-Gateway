@@ -14,6 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 GATEWAY_KEY = ""
+RPM_KEY = ""
+CONCURRENCY_KEY = ""
+BUDGET_KEY = ""
 TENANT_B_KEY = ""
 EXPIRED_KEY = ""
 DISABLED_KEY = ""
@@ -44,6 +47,8 @@ class MockProviderState:
         self.active_streams = 0
         self.stream_events_sent = 0
         self.stream_events_total = 0
+        self.health_status = 200
+        self.health_requests = []
 
     def reset(self, scenario="success"):
         with self.lock:
@@ -67,9 +72,27 @@ class MockProviderState:
         with self.lock:
             return self.stream_events_sent, self.stream_events_total
 
+    def set_health(self, status):
+        with self.lock:
+            self.health_status = status
+            self.health_requests.clear()
+
+    def health_snapshot(self):
+        with self.lock:
+            return self.health_status, list(self.health_requests)
+
 
 class MockProviderHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_json(404, {"error": "not found"})
+            return
+        with self.server.state.lock:
+            status = self.server.state.health_status
+            self.server.state.health_requests.append(time.monotonic())
+        self.send_json(status, {"ok": status == 200})
 
     def do_POST(self):
         if self.path == "/control":
@@ -356,6 +379,29 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.server.state.stream_finished.set()
             self.close_connection = True
+        elif scenario == "stream_usage_exact":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("X-Request-ID", "provider-request-stream-usage-1")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            completed = {
+                "type": "response.completed", "sequence_number": 1,
+                "response": {"id": "resp_stream_usage", "usage": {
+                    "input_tokens": 1100,
+                    "input_tokens_details": {"cached_tokens": 100},
+                    "output_tokens": 250,
+                    "total_tokens": 1350,
+                }},
+            }
+            self.wfile.write(
+                b'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+                + ("event: response.completed\ndata: "
+                   + json.dumps(completed, separators=(",", ":")) + "\n\n").encode()
+                + b"data: [DONE]\n\n"
+            )
+            self.wfile.flush()
+            self.close_connection = True
         elif scenario == "status400":
             self.send_json(400, {"error": {"message": "provider detail"}})
         elif scenario == "status429":
@@ -366,6 +412,18 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             self.send_raw(200, b"not-json", "application/json")
         elif scenario == "too_large":
             self.send_raw(200, b"{" + b"x" * 3000 + b"}", "application/json")
+        elif scenario == "usage_exact":
+            self.send_json(
+                200,
+                {"id": "resp_usage", "object": "response", "model": "provider-model",
+                 "output": [], "usage": {
+                     "input_tokens": 1100,
+                     "input_tokens_details": {"cached_tokens": 100},
+                     "output_tokens": 250,
+                     "total_tokens": 1350,
+                 }},
+                {"X-Request-ID": "provider-request-usage-1"},
+            )
         elif scenario == "slow":
             try:
                 self.send_json(200, {"id": "resp_late", "object": "response", "output": []})
@@ -405,6 +463,7 @@ class GatewayIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         global GATEWAY_KEY, TENANT_B_KEY, EXPIRED_KEY, DISABLED_KEY
+        global RPM_KEY, CONCURRENCY_KEY, BUDGET_KEY
         global DISABLED_TENANT_KEY, DISABLED_POLICY_KEY
         global PROTOCOL_DENY_KEY, MODEL_DENY_KEY, PROVIDER_DENY_KEY
         cls.gateway_binary = sys.argv[1]
@@ -489,6 +548,18 @@ class GatewayIntegrationTest(unittest.TestCase):
         cls.run_admin("apply-config", "--file", config_path)
         GATEWAY_KEY = cls.run_admin(
             "issue-key", "--tenant", "tenant-a", "--policy", "default", "--name", "phase2-regression"
+        ).stdout.strip()
+        RPM_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default", "--name", "rpm-key",
+            "--quota", "rpm-two"
+        ).stdout.strip()
+        CONCURRENCY_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default",
+            "--name", "concurrency-key", "--quota", "concurrency-one"
+        ).stdout.strip()
+        BUDGET_KEY = cls.run_admin(
+            "issue-key", "--tenant", "tenant-a", "--policy", "default",
+            "--name", "budget-key", "--quota", "budget-fifty-cents"
         ).stdout.strip()
         TENANT_B_KEY = cls.run_admin(
             "issue-key", "--tenant", "tenant-b", "--policy", "default", "--name", "tenant-b-key"
@@ -663,6 +734,18 @@ class GatewayIntegrationTest(unittest.TestCase):
                 {"slug": "tenant-disabled", "name": "Disabled Tenant", "status": "disabled"},
                 {"slug": "tenant-policy", "name": "Policy Tenant", "status": "active"},
             ],
+            "quota_policies": [
+                {"tenant": "tenant-a", "slug": "rpm-two", "name": "RPM Two",
+                 "rpm": 2, "status": "active"},
+                {"tenant": "tenant-a", "slug": "concurrency-one",
+                 "name": "Concurrency One", "rpm": 100, "concurrency": 1,
+                 "status": "active"},
+                {"tenant": "tenant-a", "slug": "credential-one",
+                 "name": "Credential One", "rpm": 1, "status": "active"},
+                {"tenant": "tenant-a", "slug": "budget-fifty-cents",
+                 "name": "Budget Fifty Cents", "daily_budget_usd": "0.50",
+                 "reservation_per_attempt_usd": "0.10", "status": "active"},
+            ],
             "providers": [
                 {"tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
                  "status": "active",
@@ -725,6 +808,14 @@ class GatewayIntegrationTest(unittest.TestCase):
                 {"tenant": "tenant-b", "protocol": "responses", "logical_model": "tenant-b-only",
                  "name": "primary", "provider": "provider-b", "endpoint": "responses",
                  "credential": "default", "upstream_model": "provider-model-b-only", "status": "active"},
+            ],
+            "model_prices": [
+                {"tenant": "tenant-a", "provider": "provider-a",
+                 "upstream_model": "provider-model", "version": "2026-08-01",
+                 "effective_at": "2026-08-01T00:00:00Z",
+                 "input_per_million_usd": "1.00",
+                 "cached_input_per_million_usd": "0.10",
+                 "output_per_million_usd": "4.00", "status": "active"},
             ],
         }
 
@@ -832,6 +923,418 @@ class GatewayIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["id"], "gateway-model")
+
+    def test_phase5_rpm_is_shared_across_gateway_nodes(self):
+        headers = {"Authorization": f"Bearer {RPM_KEY}", "Content-Type": "application/json"}
+        payload = json.dumps({"model": "gateway-model", "input": "quota", "stream": False})
+        first = self.request_at(self.gateway_port, "POST", "/v1/responses", payload, headers)
+        second = self.request_at(
+            self.gateway_secondary_port, "POST", "/v1/responses", payload, headers
+        )
+        denied = self.request_at(self.gateway_port, "POST", "/v1/responses", payload, headers)
+        self.assertEqual(first[0], 200)
+        self.assertEqual(second[0], 200)
+        self.assertEqual(denied[0], 429)
+        self.assertEqual(json.loads(denied[2])["error"]["code"], "rate_limit_exceeded")
+        self.assertIn("retry-after", {name.lower() for name in denied[1]})
+
+    def test_phase5_concurrency_lease_is_shared_and_released(self):
+        self.provider_state.reset("stream_concurrent_slow")
+        headers = {"Authorization": f"Bearer {CONCURRENCY_KEY}",
+                   "Content-Type": "application/json"}
+        payload = json.dumps({"model": "gateway-model", "input": "hold", "stream": True})
+        result = []
+        active = threading.Thread(
+            target=lambda: result.append(
+                self.request_at(self.gateway_port, "POST", "/v1/responses",
+                                payload, headers, timeout=3)
+            )
+        )
+        active.start()
+        time.sleep(0.08)
+        denied = self.request_at(
+            self.gateway_secondary_port, "POST", "/v1/responses", payload, headers
+        )
+        self.assertEqual(denied[0], 429)
+        self.assertEqual(
+            json.loads(denied[2])["error"]["code"], "concurrency_limit_exceeded"
+        )
+        active.join(timeout=3)
+        self.assertFalse(active.is_alive())
+        self.assertEqual(result[0][0], 200)
+
+        self.provider_state.reset()
+        deadline = time.time() + 2
+        released = None
+        while time.time() < deadline:
+            released = self.request_at(
+                self.gateway_secondary_port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "released", "stream": False}),
+                headers,
+            )
+            if released[0] == 200:
+                break
+            self.assertEqual(
+                json.loads(released[2])["error"]["code"], "concurrency_limit_exceeded"
+            )
+            time.sleep(0.01)
+        self.assertEqual(released[0], 200)
+
+    def test_phase5_credential_quota_skips_candidates_and_fails_without_provider_call(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "credential-backup", "provider": "provider-secondary",
+            "endpoint": "responses", "credential": "default",
+            "upstream_model": "provider-secondary-model", "priority": 200,
+            "status": "active",
+        }
+        providers = [
+            {"tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
+             "status": "active", "credentials": [
+                 {"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_A",
+                  "quota_policy": "credential-one", "status": "active"}
+             ]},
+            {"tenant": "tenant-a", "slug": "provider-secondary",
+             "name": "Provider Secondary", "status": "active", "credentials": [
+                 {"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_FAILOVER",
+                  "quota_policy": "credential-one", "status": "active"}
+             ]},
+        ]
+        try:
+            self.apply_config_patch(
+                {"providers": providers, "mappings": [secondary]},
+                "credential-quota-enable.json",
+            )
+            time.sleep(0.4)
+            headers = {"Authorization": f"Bearer {GATEWAY_KEY}",
+                       "Content-Type": "application/json"}
+            payload = json.dumps({"model": "gateway-model", "input": "credential quota"})
+
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            first = self.request("POST", "/v1/responses", payload, headers)
+            self.assertEqual(first[0], 200)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 0)
+
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            second = self.request_at(
+                self.gateway_secondary_port, "POST", "/v1/responses", payload, headers
+            )
+            self.assertEqual(second[0], 200)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 0)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            denied = self.request("POST", "/v1/responses", payload, headers)
+            self.assertEqual(denied[0], 429)
+            self.assertEqual(
+                json.loads(denied[2])["error"]["code"], "credential_quota_exceeded"
+            )
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 0)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 0)
+        finally:
+            for provider in providers:
+                provider["credentials"][0]["quota_policy"] = None
+            secondary["status"] = "disabled"
+            self.apply_config_patch(
+                {"providers": providers, "mappings": [secondary]},
+                "credential-quota-disable.json",
+            )
+            time.sleep(0.4)
+
+    def test_phase5_budget_reservation_is_atomic_and_refunds_unused_attempts(self):
+        headers = {"Authorization": f"Bearer {BUDGET_KEY}",
+                   "Content-Type": "application/json"}
+        payload = json.dumps({"model": "gateway-model", "input": "budget"})
+        self.provider_state.reset("slow_success")
+        active_result = []
+        active = threading.Thread(
+            target=lambda: active_result.append(
+                self.request("POST", "/v1/responses", payload, headers, timeout=3)
+            )
+        )
+        active.start()
+        deadline = time.time() + 2
+        while time.time() < deadline and not self.provider_state.snapshot()[1]:
+            time.sleep(0.01)
+        self.assertTrue(self.provider_state.snapshot()[1])
+
+        denied_in_flight = self.request_at(
+            self.gateway_secondary_port, "POST", "/v1/responses", payload, headers
+        )
+        self.assertEqual(denied_in_flight[0], 429)
+        self.assertEqual(
+            json.loads(denied_in_flight[2])["error"]["code"], "budget_exceeded"
+        )
+        active.join(timeout=3)
+        self.assertFalse(active.is_alive())
+        self.assertEqual(active_result[0][0], 200)
+        key_id = self.public_key_id(BUDGET_KEY)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            completed = self.database_query(
+                "SELECT COUNT(*) FROM usage_records WHERE state='succeeded' "
+                f"AND api_key_id=(SELECT id FROM api_keys WHERE key_id='{key_id}')"
+            ).strip()
+            if completed == "1":
+                break
+            time.sleep(0.01)
+        self.assertEqual(completed, "1")
+
+        self.provider_state.reset()
+        second = self.request("POST", "/v1/responses", payload, headers)
+        third = self.request_at(
+            self.gateway_secondary_port, "POST", "/v1/responses", payload, headers
+        )
+        self.assertEqual(second[0], 200)
+        self.assertEqual(third[0], 200)
+
+        calls_before_denial = len(self.provider_state.snapshot()[1])
+        denied_spent = self.request("POST", "/v1/responses", payload, headers)
+        self.assertEqual(denied_spent[0], 429)
+        self.assertEqual(json.loads(denied_spent[2])["error"]["type"], "insufficient_quota")
+        self.assertEqual(json.loads(denied_spent[2])["error"]["code"], "budget_exceeded")
+        self.assertEqual(len(self.provider_state.snapshot()[1]), calls_before_denial)
+
+        usage = self.database_query(
+            "SELECT state, attempt_count, cost_microusd, cost_quality FROM usage_records "
+            f"WHERE api_key_id=(SELECT id FROM api_keys WHERE key_id='{key_id}') "
+            "ORDER BY id"
+        ).strip().splitlines()
+        self.assertEqual(usage, [
+            "succeeded\t1\t100000\testimated",
+            "succeeded\t1\t100000\testimated",
+            "succeeded\t1\t100000\testimated",
+        ])
+        period = self.database_query(
+            "SELECT reserved_microusd, settled_microusd FROM budget_periods "
+            f"WHERE scope_type='api_key' AND scope_id=(SELECT id FROM api_keys WHERE key_id='{key_id}') "
+            "AND period_kind='day' AND period_start=UTC_DATE()"
+        ).strip()
+        self.assertEqual(period, "0\t300000")
+
+    def test_phase5_non_stream_usage_uses_effective_price_and_exact_integer_cost(self):
+        self.provider_state.reset("usage_exact")
+        status, headers, body = self.request(
+            "POST", "/v1/responses",
+            json.dumps({"model": "gateway-model", "input": "priced"}),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["usage"]["input_tokens"], 1100)
+        request_id = {key.lower(): value for key, value in headers.items()}["x-request-id"]
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            usage = self.database_query(
+                "SELECT state, input_tokens, cached_input_tokens, output_tokens, "
+                "usage_quality, cost_microusd, cost_quality FROM usage_records "
+                f"WHERE request_id='{request_id}'"
+            ).strip()
+            if usage.startswith("succeeded"):
+                break
+            time.sleep(0.01)
+        self.assertEqual(usage, "succeeded\t1100\t100\t250\texact\t2010\texact")
+        attempt = self.database_query(
+            "SELECT provider_request_id, first_byte_ms IS NOT NULL, input_tokens, "
+            "cached_input_tokens, output_tokens, usage_quality, mp.version, "
+            "ra.cost_microusd, ra.cost_quality FROM request_attempts ra "
+            "LEFT JOIN model_prices mp ON mp.id=ra.model_price_id "
+            f"WHERE ra.request_id='{request_id}'"
+        ).strip()
+        self.assertEqual(
+            attempt,
+            "provider-request-usage-1\t1\t1100\t100\t250\texact\t2026-08-01\t2010\texact",
+        )
+
+    def test_phase5_stream_usage_is_read_from_response_completed(self):
+        self.provider_state.reset("stream_usage_exact")
+        status, headers, body = self.request(
+            "POST", "/v1/responses",
+            json.dumps({"model": "gateway-model", "input": "priced stream", "stream": True}),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"event: response.completed", body)
+        self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
+        request_id = {key.lower(): value for key, value in headers.items()}["x-request-id"]
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            usage = self.database_query(
+                "SELECT state, input_tokens, cached_input_tokens, output_tokens, "
+                "usage_quality, cost_microusd, cost_quality FROM usage_records "
+                f"WHERE request_id='{request_id}'"
+            ).strip()
+            if usage.startswith("succeeded"):
+                break
+            time.sleep(0.01)
+        self.assertEqual(usage, "succeeded\t1100\t100\t250\texact\t2010\texact")
+        attempt = self.database_query(
+            "SELECT provider_request_id, input_tokens, cached_input_tokens, output_tokens, "
+            "cost_microusd, cost_quality FROM request_attempts "
+            f"WHERE request_id='{request_id}'"
+        ).strip()
+        self.assertEqual(
+            attempt, "provider-request-stream-usage-1\t1100\t100\t250\t2010\texact"
+        )
+
+    def test_phase5_metrics_are_prometheus_text_and_exclude_sensitive_dimensions(self):
+        self.provider_state.reset("usage_exact")
+        prompt = "metrics-prompt-must-not-appear"
+        status, headers, _ = self.request(
+            "POST", "/v1/responses",
+            json.dumps({"model": "gateway-model", "input": prompt}),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        request_id = {key.lower(): value for key, value in headers.items()}["x-request-id"]
+        deadline = time.time() + 2
+        metrics = b""
+        while time.time() < deadline:
+            metric_status, metric_headers, metrics = self.request("GET", "/metrics")
+            if metric_status == 200 and b'ai_gateway_input_tokens_total' in metrics:
+                break
+            time.sleep(0.01)
+        self.assertEqual(metric_status, 200)
+        self.assertTrue(
+            {key.lower(): value for key, value in metric_headers.items()}["content-type"].startswith(
+                "text/plain"
+            )
+        )
+        text = metrics.decode()
+        self.assertIn("# TYPE ai_gateway_requests_total counter", text)
+        self.assertIn('tenant="tenant-a"', text)
+        self.assertIn('logical_model="gateway-model"', text)
+        self.assertIn('provider="provider-a"', text)
+        self.assertIn('credential="default"', text)
+        self.assertIn("ai_gateway_input_tokens_total", text)
+        self.assertIn("ai_gateway_cost_microusd_total", text)
+        self.assertIn("ai_gateway_attempt_first_byte_ms", text)
+        for sensitive in (
+            GATEWAY_KEY, PROVIDER_KEY, prompt, request_id,
+            f"http://127.0.0.1:{self.provider_port}/v1/responses",
+        ):
+            self.assertNotIn(sensitive, text)
+
+    def test_phase5_two_nodes_share_health_probe_and_exclude_then_restore_candidate(self):
+        secondary = {
+            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
+            "name": "health-backup", "provider": "provider-secondary",
+            "endpoint": "responses", "credential": "default",
+            "upstream_model": "provider-secondary-model", "priority": 200,
+            "status": "active",
+        }
+        health = {
+            "tenant": "tenant-a", "provider": "provider-a", "name": "non-billable",
+            "endpoint": "responses", "credential": "default", "method": "GET",
+            "url": f"http://127.0.0.1:{self.provider_port}/health",
+            "interval_ms": 1000, "timeout_ms": 200, "status": "active",
+        }
+        try:
+            usage_before = self.database_query("SELECT COUNT(*) FROM usage_records").strip()
+            attempts_before = self.database_query("SELECT COUNT(*) FROM request_attempts").strip()
+            self.provider_state.set_health(500)
+            self.apply_config_patch(
+                {"mappings": [secondary], "health_checks": [health]},
+                "health-probe-enable.json",
+            )
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                _, probes = self.provider_state.health_snapshot()
+                if len(probes) >= 3:
+                    break
+                time.sleep(0.05)
+            self.assertGreaterEqual(len(probes), 3)
+            for previous, current in zip(probes, probes[1:]):
+                self.assertGreater(current - previous, 0.65)
+            self.assertEqual(
+                self.database_query("SELECT COUNT(*) FROM usage_records").strip(), usage_before
+            )
+            self.assertEqual(
+                self.database_query("SELECT COUNT(*) FROM request_attempts").strip(),
+                attempts_before,
+            )
+
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            status, _, body = self.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "health excluded"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 0)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+
+            self.provider_state.set_health(200)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                _, recovered = self.provider_state.health_snapshot()
+                if recovered:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(
+                recovered,
+                "primary logs:\n" + "".join(self.logs[-20:])
+                + "\nsecondary logs:\n" + "".join(self.secondary_logs[-20:]),
+            )
+            time.sleep(0.2)
+            self.provider_state.reset()
+            self.provider_secondary_state.reset()
+            status, _, body = self.request_at(
+                self.gateway_secondary_port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "health restored"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 0)
+        finally:
+            health["status"] = "disabled"
+            secondary["status"] = "disabled"
+            self.apply_config_patch(
+                {"mappings": [secondary], "health_checks": [health]},
+                "health-probe-disable.json",
+            )
+            time.sleep(0.4)
+
+    def test_phase5_coordinator_abandons_expired_usage_and_releases_budget(self):
+        key_id = self.public_key_id(BUDGET_KEY)
+        fixture_request_id = "req_phase5_abandoned_fixture"
+        self.database_query(
+            "INSERT INTO usage_records(request_id, tenant_id, api_key_id, logical_model_id, "
+            "protocol, stream, state) SELECT '" + fixture_request_id + "', ak.tenant_id, ak.id, "
+            "lm.id, 'responses', 0, 'started' FROM api_keys ak JOIN logical_models lm "
+            "ON lm.tenant_id=ak.tenant_id AND lm.name='gateway-model' "
+            f"WHERE ak.key_id='{key_id}'; "
+            "SET @usage_id=LAST_INSERT_ID(); "
+            "INSERT INTO budget_periods(scope_type, scope_id, period_kind, period_start, "
+            "limit_microusd, reserved_microusd) SELECT 'api_key', id, 'day', UTC_DATE(), "
+            f"500000, 100000 FROM api_keys WHERE key_id='{key_id}' "
+            "ON DUPLICATE KEY UPDATE reserved_microusd=reserved_microusd+100000; "
+            "INSERT INTO budget_reservations(usage_record_id, scope_type, scope_id, period_kind, "
+            "period_start, reserved_microusd, lease_expires_at) SELECT @usage_id, 'api_key', id, "
+            f"'day', UTC_DATE(), 100000, UTC_TIMESTAMP(6)-INTERVAL 1 SECOND FROM api_keys WHERE key_id='{key_id}'"
+        )
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            state = self.database_query(
+                "SELECT ur.state, ur.usage_quality, ur.cost_quality, br.state "
+                "FROM usage_records ur JOIN budget_reservations br ON br.usage_record_id=ur.id "
+                f"WHERE ur.request_id='{fixture_request_id}'"
+            ).strip()
+            if state.startswith("abandoned"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(state, "abandoned\tunknown\tunknown\treleased")
+        reserved = self.database_query(
+            "SELECT reserved_microusd FROM budget_periods "
+            f"WHERE scope_type='api_key' AND scope_id=(SELECT id FROM api_keys WHERE key_id='{key_id}') "
+            "AND period_kind='day' AND period_start=UTC_DATE()"
+        ).strip()
+        self.assertEqual(reserved, "0")
 
     def test_phase3_tenants_resolve_the_same_name_independently(self):
         self.provider_state.reset()
@@ -1599,6 +2102,13 @@ class GatewayIntegrationTest(unittest.TestCase):
             else:
                 self.fail("nginx did not become ready")
 
+            metrics = http.client.HTTPConnection("127.0.0.1", nginx_port, timeout=1)
+            metrics.request("GET", "/metrics")
+            metrics_response = metrics.getresponse()
+            metrics_response.read()
+            metrics.close()
+            self.assertEqual(metrics_response.status, 404)
+
             connection = http.client.HTTPConnection("127.0.0.1", nginx_port, timeout=3)
             connection.request(
                 "POST",
@@ -1620,6 +2130,92 @@ class GatewayIntegrationTest(unittest.TestCase):
             remaining = response.read()
             self.assertTrue((first_event + remaining).endswith(b"data: [DONE]\n\n"))
             connection.close()
+        finally:
+            nginx.terminate()
+            try:
+                nginx.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                nginx.kill()
+                nginx.wait(timeout=5)
+
+    @unittest.skipUnless(
+        shutil.which("nginx") and os.environ.get("LINGSUAN_API_KEY")
+        and os.environ.get("AI_GATEWAY_RUN_LIVE_TESTS") == "1",
+        "Nginx, LINGSUAN_API_KEY, and AI_GATEWAY_RUN_LIVE_TESTS=1 are required",
+    )
+    def test_lingsuan_gpt_5_6_terra_live_through_nginx(self):
+        self.run_admin(
+            "apply-config", "--file",
+            os.path.join(self.repo, "config", "ai-gateway.lingsuan.json"),
+        )
+        live_key = self.run_admin(
+            "issue-key", "--tenant", "lingsuan", "--policy", "default",
+            "--name", "phase5-live-test",
+        ).stdout.strip()
+        time.sleep(0.4)
+
+        nginx_port = free_port()
+        nginx_dir = os.path.join(self.database_temp.name, "nginx-lingsuan-live")
+        os.makedirs(nginx_dir, exist_ok=True)
+        with open(
+            os.path.join(self.repo, "deploy", "nginx", "ai-gateway.conf.example"),
+            encoding="utf-8",
+        ) as source:
+            site = source.read()
+        site = site.replace(
+            "server 127.0.0.1:8080;",
+            f"server 127.0.0.1:{self.gateway_secondary_port};",
+        ).replace("listen 8081;", f"listen {nginx_port};")
+        config_path = os.path.join(nginx_dir, "nginx.conf")
+        with open(config_path, "w", encoding="utf-8") as output:
+            output.write(
+                "worker_processes 1;\n"
+                f"pid {nginx_dir}/nginx.pid;\n"
+                f"error_log {nginx_dir}/error.log notice;\n"
+                "events { worker_connections 64; }\n"
+                "http { access_log off;\n"
+                f"{site}\n"
+                "}\n"
+            )
+        config_test = subprocess.run(
+            ["nginx", "-t", "-p", nginx_dir, "-c", config_path],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        self.assertEqual(config_test.returncode, 0, config_test.stdout)
+        nginx = subprocess.Popen(
+            ["nginx", "-p", nginx_dir, "-c", config_path, "-g", "daemon off;"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    status, _, _ = self.request_at(nginx_port, "GET", "/healthz")
+                    if status == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            else:
+                self.fail("live-test Nginx did not become ready")
+
+            environment = dict(os.environ)
+            environment.update({
+                "AI_GATEWAY_NGINX_URL": f"http://127.0.0.1:{nginx_port}",
+                "AI_GATEWAY_API_KEY": live_key,
+                "AI_GATEWAY_LIVE_TEST_MODEL": "gpt-5.6-terra",
+            })
+            live = subprocess.run(
+                [sys.executable, os.path.join(self.repo, "scripts", "test-lingsuan-nginx.py")],
+                env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False, timeout=180,
+            )
+            self.assertEqual(live.returncode, 0, live.stderr)
+            result = json.loads(live.stdout)
+            self.assertEqual(result["model"], "gpt-5.6-terra")
+            self.assertEqual(result["non_streaming_status"], 200)
+            self.assertEqual(result["streaming_status"], 200)
+            self.assertTrue(result["response_completed"] or result["done_sentinel"])
         finally:
             nginx.terminate()
             try:
@@ -2303,7 +2899,7 @@ class GatewayIntegrationTest(unittest.TestCase):
                 {"Authorization": f"Bearer {GATEWAY_KEY}"},
             )
             self.assertEqual(status, 503)
-            self.assertEqual(json.loads(body)["error"]["code"], "routing_unavailable")
+            self.assertEqual(json.loads(body)["error"]["code"], "governance_unavailable")
         finally:
             self.redis = self.start_redis()
             self.wait_for_gateway_port(self.gateway_port)

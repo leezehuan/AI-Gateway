@@ -2,6 +2,7 @@
 #define AI_GATEWAY_RUNTIME_HPP
 
 #include "gateway/gateway.hpp"
+#include "gateway/governance.hpp"
 #include "gateway/repository.hpp"
 
 #include <functional>
@@ -13,6 +14,16 @@
 
 namespace ai_gateway
 {
+struct ModelPrice
+{
+    std::uint64_t id = 0;
+    std::string version;
+    std::int64_t effective_at_epoch = 0;
+    std::uint64_t input_per_million_microusd = 0;
+    std::uint64_t cached_input_per_million_microusd = 0;
+    std::uint64_t output_per_million_microusd = 0;
+};
+
 struct ModelTarget
 {
     std::uint64_t mapping_id = 0;
@@ -25,6 +36,10 @@ struct ModelTarget
     std::string provider_url;
     std::string provider_api_key;
     std::string upstream_model;
+    std::string provider_slug;
+    std::string credential_name;
+    std::optional<QuotaPolicy> credential_quota;
+    std::vector<ModelPrice> prices;
 };
 
 struct ModelAccess
@@ -50,6 +65,8 @@ struct AuthSnapshot
     std::string public_api_key_id;
     std::unordered_set<std::string> protocols;
     std::unordered_map<std::string, ModelAccess> models;
+    std::optional<QuotaPolicy> tenant_quota;
+    std::optional<QuotaPolicy> api_key_quota;
 };
 
 enum class AuthStatus
@@ -66,11 +83,35 @@ struct AuthResult
     std::shared_ptr<const AuthSnapshot> snapshot;
 };
 
+struct HealthCheckTarget
+{
+    std::uint64_t id = 0;
+    std::uint64_t config_version = 0;
+    std::uint64_t credential_id = 0;
+    std::string provider_slug;
+    std::string credential_name;
+    std::string method;
+    std::string url;
+    std::string provider_api_key;
+    long interval_ms = 30000;
+    long timeout_ms = 2000;
+    std::optional<QuotaPolicy> credential_quota;
+    std::vector<std::string> candidate_fingerprints;
+};
+
+struct HealthCheckResult
+{
+    bool available = false;
+    std::vector<HealthCheckTarget> targets;
+};
+
 class RuntimeState
 {
 public:
     using AuthCallback = std::function<void(AuthResult)>;
     using AuditCallback = std::function<void(bool)>;
+    using AdmissionCallback = std::function<void(RequestAdmissionStatus)>;
+    using HealthCheckCallback = std::function<void(HealthCheckResult)>;
 
     RuntimeState(GatewayConfig config, GatewayRepository &repository);
     ~RuntimeState();
@@ -79,6 +120,9 @@ public:
     RuntimeState &operator=(const RuntimeState &) = delete;
 
     void authenticate(std::string api_key, AuthCallback callback);
+    void admit_request(RequestAdmission request, AdmissionCallback callback);
+    void finish_request(RequestFinish request, AuditCallback callback);
+    void load_health_checks(HealthCheckCallback callback);
     void begin_attempt(AttemptStart attempt, AuditCallback callback);
     void finish_attempt(AttemptFinish attempt, AuditCallback callback);
     bool ready() const;

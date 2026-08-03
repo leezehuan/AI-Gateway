@@ -123,6 +123,10 @@ GatewayConfig GatewayConfig::from_env()
         "AI_GATEWAY_CIRCUIT_OPEN_MS", 30000, 100, 3600000);
     config.circuit_probe_lease_ms = env_number<long>(
         "AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS", 10000, 100, 60000);
+    config.governance_lease_ttl_ms = env_number<long>(
+        "AI_GATEWAY_GOVERNANCE_LEASE_TTL_MS", 120000, 1000, 3600000);
+    config.governance_lease_renew_ms = env_number<long>(
+        "AI_GATEWAY_GOVERNANCE_LEASE_RENEW_MS", 30000, 100, 1200000);
     return config;
 }
 
@@ -143,6 +147,11 @@ void GatewayConfig::validate() const
             std::string::npos)
     {
         throw std::runtime_error("Gateway Redis configuration is invalid");
+    }
+    if (governance_lease_renew_ms * 2 >= governance_lease_ttl_ms)
+    {
+        throw std::runtime_error(
+            "AI_GATEWAY_GOVERNANCE_LEASE_RENEW_MS must be less than half the lease TTL");
     }
 }
 } // namespace ai_gateway

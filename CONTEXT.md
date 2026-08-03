@@ -72,3 +72,38 @@ _Avoid_: Authentication session, sticky connection
 Shared temporary exclusion of an unhealthy Candidate, followed by a single trial before it becomes
 generally eligible again.
 _Avoid_: permanent disablement, Access Policy
+
+**Quota Policy**:
+A Tenant-owned reusable set of optional RPM, concurrency, budget, and reservation limits that can
+be bound independently to a Tenant, API Key, or Credential.
+_Avoid_: Access Policy, price
+
+**Request Permit**:
+The distributed admission result for one client request, containing the Tenant and API Key RPM
+decision plus any active Concurrency Leases.
+_Avoid_: API Key, Auth Snapshot
+
+**Concurrency Lease**:
+A Redis entry with a renewable TTL that represents one active request or Provider operation across
+all Gateway nodes.
+_Avoid_: database lock, permanent allocation
+
+**Budget Reservation**:
+A MySQL transaction record that temporarily reserves worst-case Attempt cost from one UTC day or
+month and is later settled or released exactly once.
+_Avoid_: invoice, Usage Record
+
+**Model Price**:
+An immutable, UTC-effective Provider/upstream-model price version expressed as integer micro-USD
+per million input, cached input, and output tokens.
+_Avoid_: quota, floating-point rate
+
+**Usage Record**:
+The unique request-level accounting terminal that aggregates Attempts, normalized token Usage,
+cost, quality, and latency without storing request or response content.
+_Avoid_: Attempt audit, Prompt log
+
+**Health Check**:
+An explicitly configured, non-Usage Provider GET or HEAD operation protected by a cross-node probe
+lease and Credential quota whose result updates shared Candidate health.
+_Avoid_: `/healthz`, billable model request

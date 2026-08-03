@@ -221,7 +221,8 @@ public:
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
-                std::int64_t current_ms)
+                std::int64_t current_ms,
+                unsigned failure_threshold)
     {
         static const std::string script =
             "local score=tonumber(redis.call('HGET',KEYS[1],'score')) or 100; "
@@ -249,7 +250,8 @@ public:
                                               : affinity_key;
         const std::string success_value = success ? "1" : "0";
         const std::string retryable_value = retryable_failure ? "1" : "0";
-        const std::string threshold = std::to_string(config_.circuit_failure_threshold);
+        const std::string threshold = std::to_string(
+            failure_threshold == 0 ? config_.circuit_failure_threshold : failure_threshold);
         const std::string now = std::to_string(current_ms);
         const std::string cooldown = std::to_string(config_.circuit_open_ms);
         const std::string retry_after = std::to_string(std::min<long>(300000, retry_after_ms));
@@ -378,10 +380,11 @@ bool HiredisRoutingStore::record(const std::string &candidate_fingerprint,
                                  bool success,
                                  bool retryable_failure,
                                  long retry_after_ms,
-                                 std::int64_t current_ms)
+                                 std::int64_t current_ms,
+                                 unsigned failure_threshold)
 {
     return impl_->record(candidate_fingerprint, affinity_key, success, retryable_failure,
-                         retry_after_ms, current_ms);
+                         retry_after_ms, current_ms, failure_threshold);
 }
 
 class RoutingRuntime::Impl
@@ -532,14 +535,16 @@ public:
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
-                FeedbackCallback callback)
+                FeedbackCallback callback,
+                unsigned failure_threshold = 0)
     {
         auto shared_callback = std::make_shared<FeedbackCallback>(std::move(callback));
         if (!enqueue([this, fingerprint = std::move(fingerprint),
                       affinity_key = std::move(affinity_key), success, retryable_failure,
-                      retry_after_ms, shared_callback]() mutable {
+                      retry_after_ms, failure_threshold, shared_callback]() mutable {
                 const bool stored = store_.record(fingerprint, affinity_key, success,
-                                                  retryable_failure, retry_after_ms, now_ms());
+                                                  retryable_failure, retry_after_ms, now_ms(),
+                                                  failure_threshold);
                 ready_.store(stored);
                 try
                 {
@@ -643,6 +648,14 @@ void RoutingRuntime::record(std::string candidate_fingerprint,
 {
     impl_->record(std::move(candidate_fingerprint), std::move(affinity_key), success,
                   retryable_failure, retry_after_ms, std::move(callback));
+}
+
+void RoutingRuntime::record_health_probe(std::string candidate_fingerprint,
+                                         bool success,
+                                         FeedbackCallback callback)
+{
+    impl_->record(std::move(candidate_fingerprint), {}, success, !success, 0,
+                  std::move(callback), 3);
 }
 
 bool RoutingRuntime::ready() const { return impl_->ready(); }

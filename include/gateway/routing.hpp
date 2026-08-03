@@ -40,7 +40,8 @@ public:
                         bool success,
                         bool retryable_failure,
                         long retry_after_ms,
-                        std::int64_t now_ms) = 0;
+                        std::int64_t now_ms,
+                        unsigned failure_threshold = 0) = 0;
 };
 
 class HiredisRoutingStore final : public RoutingStore
@@ -60,7 +61,8 @@ public:
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
-                std::int64_t now_ms) override;
+                std::int64_t now_ms,
+                unsigned failure_threshold = 0) override;
 
 private:
     class Impl;
@@ -114,6 +116,9 @@ public:
                 bool retryable_failure,
                 long retry_after_ms,
                 FeedbackCallback callback);
+    void record_health_probe(std::string candidate_fingerprint,
+                             bool success,
+                             FeedbackCallback callback);
     bool ready() const;
 
 private:

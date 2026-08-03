@@ -96,14 +96,25 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
         self.run_admin("migrate", "--dir", migration_dir)
 
         config = {
-            "tenants": [{"slug": "tenant-a", "name": "Tenant A", "status": "active"}],
+            "tenants": [{"slug": "tenant-a", "name": "Tenant A", "status": "active",
+                         "quota_policy": "tenant-default"}],
+            "quota_policies": [{
+                "tenant": "tenant-a", "slug": "tenant-default", "name": "Tenant Default",
+                "rpm": 60, "concurrency": 4, "daily_budget_usd": "10.00",
+                "monthly_budget_usd": "100.00", "reservation_per_attempt_usd": "0.10",
+                "status": "active",
+            }, {
+                "tenant": "tenant-a", "slug": "credential-default",
+                "name": "Credential Default", "rpm": 120, "concurrency": 8,
+                "status": "active",
+            }],
             "providers": [{
                 "tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
                 "status": "active",
                 "endpoints": [{"name": "responses", "protocol": "responses",
                                "url": "http://127.0.0.1:9999/v1/responses", "status": "active"}],
                 "credentials": [{"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET",
-                                 "status": "active"}],
+                                 "quota_policy": "credential-default", "status": "active"}],
             }],
             "logical_models": [{"tenant": "tenant-a", "protocol": "responses",
                                 "name": "shared-model", "status": "active",
@@ -116,6 +127,20 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
                           "endpoint": "responses", "credential": "default",
                           "upstream_model": "provider-model-a", "priority": 7,
                           "status": "active"}],
+            "model_prices": [{
+                "tenant": "tenant-a", "provider": "provider-a",
+                "upstream_model": "provider-model-a", "version": "2026-08-01",
+                "effective_at": "2026-08-01T00:00:00Z",
+                "input_per_million_usd": "1.00",
+                "cached_input_per_million_usd": "0.10",
+                "output_per_million_usd": "4.00", "status": "active",
+            }],
+            "health_checks": [{
+                "tenant": "tenant-a", "provider": "provider-a", "name": "models",
+                "endpoint": "responses", "credential": "default", "method": "GET",
+                "url": "http://127.0.0.1:9999/v1/models", "interval_ms": 30000,
+                "timeout_ms": 2000, "status": "active",
+            }],
         }
         path = os.path.join(self.temp.name, "config.json")
         with open(path, "w", encoding="utf-8") as output:
@@ -137,6 +162,41 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
             ),
             "1",
         )
+        self.assertEqual(
+            self.query(
+                "SELECT qp.slug, qp.rpm_limit, qp.concurrency_limit, qp.daily_budget_microusd, "
+                "qp.monthly_budget_microusd, qp.reservation_per_attempt_microusd "
+                "FROM tenants t JOIN quota_policies qp ON qp.id=t.quota_policy_id "
+                "WHERE t.slug='tenant-a'"
+            ),
+            "tenant-default\t60\t4\t10000000\t100000000\t100000",
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT qp.slug FROM provider_credentials pc "
+                "JOIN quota_policies qp ON qp.id=pc.quota_policy_id WHERE pc.name='default'"
+            ),
+            "credential-default",
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT version, input_per_million_microusd, cached_input_per_million_microusd, "
+                "output_per_million_microusd FROM model_prices"
+            ),
+            "2026-08-01\t1000000\t100000\t4000000",
+        )
+        self.assertEqual(
+            self.query("SELECT method, interval_ms, timeout_ms FROM provider_health_checks"),
+            "GET\t30000\t2000",
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='ai_gateway' "
+                "AND table_name IN ('quota_policies','model_prices','usage_records',"
+                "'budget_periods','budget_reservations','provider_health_checks')"
+            ),
+            "6",
+        )
         applied_version = int(self.query(
             "SELECT version FROM gateway_config_versions WHERE singleton_id=1"
         ))
@@ -151,8 +211,33 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
             applied_version + 1,
         )
         issued = self.run_admin("issue-key", "--tenant", "tenant-a", "--policy", "default",
-                                "--name", "test key").stdout.strip()
+                                "--name", "test key", "--quota", "tenant-default").stdout.strip()
         self.assertRegex(issued, r"^aigw_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{43}$")
+        key_id = self.query("SELECT key_id FROM api_keys")
+        self.assertEqual(
+            self.query(
+                "SELECT qp.slug FROM api_keys ak JOIN quota_policies qp "
+                "ON qp.id=ak.quota_policy_id WHERE ak.key_id='" + key_id + "'"
+            ),
+            "tenant-default",
+        )
+        self.run_admin("set-key-quota", "--key-id", key_id, "--quota", "none")
+        self.assertEqual(
+            self.query("SELECT quota_policy_id IS NULL FROM api_keys WHERE key_id='" + key_id + "'"),
+            "1",
+        )
+        self.run_admin("set-key-quota", "--key-id", key_id, "--quota", "tenant-default")
+
+        conflicting_price = json.loads(json.dumps(config))
+        conflicting_price["model_prices"][0]["output_per_million_usd"] = "5.00"
+        conflicting_price_path = os.path.join(self.temp.name, "conflicting-price.json")
+        with open(conflicting_price_path, "w", encoding="utf-8") as output:
+            json.dump(conflicting_price, output)
+        rejected_price = self.run_admin(
+            "apply-config", "--file", conflicting_price_path, check=False
+        )
+        self.assertNotEqual(rejected_price.returncode, 0)
+        self.assertIn("immutable", rejected_price.stderr)
 
         dump = subprocess.run(
             ["mariadb", "--no-defaults", "-h", "127.0.0.1", "-P", str(self.port),
