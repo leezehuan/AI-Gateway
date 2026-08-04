@@ -36,6 +36,7 @@ add_library(ai_gateway_runtime STATIC
     repository.cpp
     runtime.cpp
     routing.cpp
+    protocol.cpp
     governance.cpp
     metrics.cpp
     health.cpp

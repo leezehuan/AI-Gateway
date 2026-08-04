@@ -122,3 +122,27 @@ _Avoid_: Quota Policy, readiness, libcurl queue
 The node state entered after a termination signal in which new valid proxy requests are rejected
 while already admitted work is allowed a bounded natural-completion window.
 _Avoid_: dependency outage, capacity saturation, process crash
+
+**Protocol Adapter**:
+A Gateway module that recognizes one client protocol, validates its request, supplies the native
+Provider headers, and classifies its JSON or SSE response. It does not convert another protocol.
+_Avoid_: HTTP Handler, Provider
+
+**Chat Completions**:
+The OpenAI-compatible `/v1/chat/completions` protocol using a `messages` array and optional native
+data-only SSE.
+_Avoid_: Responses request, legacy message protocol
+
+**Anthropic Messages**:
+The native `/v1/messages` protocol using Anthropic request fields and named SSE events.
+_Avoid_: Chat Completions, protocol conversion
+
+**Native Pass-through**:
+A request or response remains in the selected protocol's wire shape while the Gateway only changes
+the logical model, credentials, and controlled metadata.
+_Avoid_: translation, normalization across providers
+
+**Protocol Error**:
+A client-visible error encoded by the selected Protocol Adapter, including its status, type,
+parameter and code semantics.
+_Avoid_: Provider Secret, implementation exception

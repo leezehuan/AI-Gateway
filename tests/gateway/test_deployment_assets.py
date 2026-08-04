@@ -37,6 +37,9 @@ class DeploymentAssetsTest(unittest.TestCase):
         path = cls.repo / "config" / "ai-gateway.lingsuan.json"
         cls.raw_config = path.read_text(encoding="utf-8")
         cls.config = json.loads(cls.raw_config)
+        cls.protocol_config = json.loads(
+            (cls.repo / "config" / "ai-gateway.protocols.example.json").read_text(encoding="utf-8")
+        )
         cls.live_test = (
             cls.repo / "scripts" / "test-lingsuan-nginx.py"
         ).read_text(encoding="utf-8")
@@ -102,6 +105,23 @@ class DeploymentAssetsTest(unittest.TestCase):
     def test_public_nginx_proxy_does_not_expose_metrics(self):
         self.assertIn("location = /metrics", self.nginx_config)
         self.assertIn("return 404", self.nginx_config)
+
+    def test_protocol_example_covers_native_phase7_adapters(self):
+        protocols = {
+            endpoint["protocol"]
+            for provider in self.protocol_config["providers"]
+            for endpoint in provider["endpoints"]
+        }
+        self.assertEqual(protocols, {"responses", "chat_completions", "anthropic_messages"})
+        self.assertNotIn("sk-", json.dumps(self.protocol_config))
+
+    def test_default_identity_is_gateway_only(self):
+        cmake = (self.repo / "CMakeLists.txt").read_text(encoding="utf-8")
+        readme = (self.repo / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn("BUILD_CHAT_SERVER", cmake)
+        self.assertNotIn("BUILD_CHAT_CLIENT", cmake)
+        self.assertNotIn("ChatServer", readme)
+        self.assertNotIn("ChatClient", readme)
 
     def test_nginx_uses_two_least_connection_upstreams_without_post_replay(self):
         self.assertIn("least_conn;", self.nginx_config)

@@ -146,6 +146,14 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as output:
             json.dump(config, output)
         self.run_admin("apply-config", "--file", path)
+        unsupported = json.loads(json.dumps(config))
+        unsupported["providers"][0]["endpoints"][0]["protocol"] = "gemini"
+        unsupported_path = os.path.join(self.temp.name, "unsupported.json")
+        with open(unsupported_path, "w", encoding="utf-8") as output:
+            json.dump(unsupported, output)
+        rejected = self.run_admin("apply-config", "--file", unsupported_path, check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unsupported Gateway protocol", rejected.stderr)
         self.assertEqual(
             self.query(
                 "SELECT rp.scheduling_mode, rp.max_attempts, mm.priority "

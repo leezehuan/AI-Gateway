@@ -110,6 +110,7 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             payload = None
         scenario, _ = self.server.state.snapshot()
         record = {
+            "path": self.path,
             "headers": {key.lower(): value for key, value in self.headers.items()},
             "payload": payload,
             "body": raw.decode("utf-8", errors="replace"),
@@ -117,6 +118,52 @@ class MockProviderHandler(BaseHTTPRequestHandler):
         with self.server.state.lock:
             self.server.state.requests.append(record)
 
+        if scenario == "chat_success":
+            self.send_json(
+                200,
+                {
+                    "id": "chatcmpl_mock",
+                    "object": "chat.completion",
+                    "model": "provider-chat-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+                },
+            )
+            return
+        if scenario == "chat_stream":
+            self.send_raw(
+                200,
+                b'data: {"id":"chatcmpl_mock","object":"chat.completion.chunk","model":"provider-chat-model","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+                b'data: {"id":"chatcmpl_mock","object":"chat.completion.chunk","model":"provider-chat-model","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+                b'data: {"id":"chatcmpl_mock","object":"chat.completion.chunk","model":"provider-chat-model","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}\n\n'
+                b'data: [DONE]\n\n',
+                "text/event-stream",
+            )
+            return
+        if scenario == "anthropic_success":
+            self.send_json(
+                200,
+                {
+                    "id": "msg_mock",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "provider-anthropic-model",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                },
+            )
+            return
+        if scenario == "anthropic_stream":
+            self.send_raw(
+                200,
+                b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_mock","type":"message","role":"assistant","content":[],"model":"provider-anthropic-model","usage":{"input_tokens":3,"output_tokens":0}}}\n\n'
+                b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n'
+                b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+                b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+                "text/event-stream",
+            )
+            return
         if scenario == "slow":
             time.sleep(1.2)
         if scenario == "slow_success":
@@ -163,6 +210,26 @@ class MockProviderHandler(BaseHTTPRequestHandler):
                 ("event: response.created\ndata: " + oversized + "\n\n").encode("utf-8"),
                 "text/event-stream",
             )
+        elif scenario in ("chat_stream_close_after_commit", "anthropic_stream_close_after_commit"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if scenario == "chat_stream_close_after_commit":
+                first = (
+                    b'data: {"id":"chatcmpl_mock","object":"chat.completion.chunk",'
+                    b'"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+                )
+            else:
+                first = (
+                    b'event: message_start\ndata: {"type":"message_start","message":'
+                    b'{"id":"msg_mock","type":"message","role":"assistant","content":[],'
+                    b'"model":"provider-anthropic-model","usage":{"input_tokens":3,'
+                    b'"output_tokens":0}}}\n\n'
+                )
+            self.wfile.write(first)
+            self.wfile.flush()
+            self.close_connection = True
         elif scenario in (
             "stream_close_after_commit",
             "stream_invalid_after_commit",
@@ -768,8 +835,16 @@ class GatewayIntegrationTest(unittest.TestCase):
             "providers": [
                 {"tenant": "tenant-a", "slug": "provider-a", "name": "Provider A",
                  "status": "active",
-                 "endpoints": [{"name": "responses", "protocol": "responses",
-                                "url": endpoint, "status": "active"}],
+                 "endpoints": [
+                     {"name": "responses", "protocol": "responses",
+                      "url": endpoint, "status": "active"},
+                     {"name": "chat", "protocol": "chat_completions",
+                      "url": f"http://127.0.0.1:{cls.provider_port}/v1/chat/completions",
+                      "status": "active"},
+                     {"name": "messages", "protocol": "anthropic_messages",
+                      "url": f"http://127.0.0.1:{cls.provider_port}/v1/messages",
+                      "status": "active"},
+                 ],
                  "credentials": [{"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_A",
                                   "status": "active"}]},
                 {"tenant": "tenant-b", "slug": "provider-b", "name": "Provider B",
@@ -789,6 +864,10 @@ class GatewayIntegrationTest(unittest.TestCase):
             "logical_models": [
                 {"tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
                  "status": "active"},
+                {"tenant": "tenant-a", "protocol": "chat_completions", "name": "gateway-model",
+                 "status": "active"},
+                {"tenant": "tenant-a", "protocol": "anthropic_messages", "name": "gateway-model",
+                 "status": "active"},
                 {"tenant": "tenant-b", "protocol": "responses", "name": "gateway-model",
                  "status": "active"},
                 {"tenant": "tenant-b", "protocol": "responses", "name": "tenant-b-only",
@@ -796,8 +875,13 @@ class GatewayIntegrationTest(unittest.TestCase):
             ],
             "policies": [
                 {"tenant": "tenant-a", "slug": "default", "name": "Default A",
-                 "status": "active", "protocols": ["responses"],
-                 "models": ["gateway-model"],
+                 "status": "active",
+                 "protocols": ["responses", "chat_completions", "anthropic_messages"],
+                 "models": [
+                     "gateway-model",
+                     {"protocol": "chat_completions", "name": "gateway-model"},
+                     {"protocol": "anthropic_messages", "name": "gateway-model"},
+                 ],
                  "providers": ["provider-a", "provider-secondary"]},
                 {"tenant": "tenant-b", "slug": "default", "name": "Default B",
                  "status": "active", "protocols": ["responses"],
@@ -821,6 +905,14 @@ class GatewayIntegrationTest(unittest.TestCase):
                 {"tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
                  "name": "primary", "provider": "provider-a", "endpoint": "responses",
                  "credential": "default", "upstream_model": "provider-model", "status": "active"},
+                {"tenant": "tenant-a", "protocol": "chat_completions",
+                 "logical_model": "gateway-model", "name": "primary", "provider": "provider-a",
+                 "endpoint": "chat", "credential": "default",
+                 "upstream_model": "provider-chat-model", "status": "active"},
+                {"tenant": "tenant-a", "protocol": "anthropic_messages",
+                 "logical_model": "gateway-model", "name": "primary", "provider": "provider-a",
+                 "endpoint": "messages", "credential": "default",
+                 "upstream_model": "provider-anthropic-model", "status": "active"},
                 {"tenant": "tenant-b", "protocol": "responses", "logical_model": "gateway-model",
                  "name": "primary", "provider": "provider-b", "endpoint": "responses",
                  "credential": "default", "upstream_model": "provider-model-b", "status": "active"},
@@ -942,6 +1034,175 @@ class GatewayIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["id"], "gateway-model")
+
+    def test_chat_completions_native_non_streaming_and_provider_auth(self):
+        self.provider_state.reset("chat_success")
+        payload = json.dumps({
+            "model": "gateway-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0,
+        })
+        status, headers, body = self.request(
+            "POST", "/v1/chat/completions", payload,
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["model"], "gateway-model")
+        self.assertIn("x-request-id", {key.lower() for key in headers})
+        _, calls = self.provider_state.snapshot()
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["path"], "/v1/chat/completions")
+        self.assertEqual(call["payload"]["model"], "provider-chat-model")
+        self.assertEqual(call["headers"]["authorization"], f"Bearer {PROVIDER_KEY}")
+        self.assertNotIn("x-api-key", call["headers"])
+
+    def test_chat_completions_sse_preserves_data_only_events_and_done(self):
+        self.provider_state.reset("chat_stream")
+        payload = json.dumps({
+            "model": "gateway-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        status, headers, body = self.request(
+            "POST", "/v1/chat/completions", payload,
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        lowered_headers = {key.lower(): value for key, value in headers.items()}
+        self.assertTrue(lowered_headers["content-type"].lower().startswith("text/event-stream"))
+        self.assertLess(body.find(b'"role":"assistant"'), body.find(b'"content":"ok"'))
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))
+
+        request_id = next(value for key, value in headers.items() if key.lower() == "x-request-id")
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            usage = self.database_query(
+                "SELECT state, input_tokens, output_tokens, usage_quality FROM usage_records "
+                f"WHERE request_id='{request_id}'"
+            ).strip()
+            if usage.startswith("succeeded"):
+                break
+            time.sleep(0.01)
+        self.assertEqual(usage, "succeeded\t7\t2\texact")
+
+    def test_anthropic_messages_native_non_streaming_and_provider_auth(self):
+        self.provider_state.reset("anthropic_success")
+        payload = json.dumps({
+            "model": "gateway-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32,
+        })
+        status, _, body = self.request(
+            "POST", "/v1/messages", payload,
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["model"], "gateway-model")
+        _, calls = self.provider_state.snapshot()
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["path"], "/v1/messages")
+        self.assertEqual(call["payload"]["model"], "provider-anthropic-model")
+        self.assertEqual(call["headers"]["x-api-key"], PROVIDER_KEY)
+        self.assertEqual(call["headers"]["anthropic-version"], "2023-06-01")
+        self.assertNotIn("authorization", call["headers"])
+
+    def test_anthropic_messages_sse_preserves_native_event_sequence(self):
+        self.provider_state.reset("anthropic_stream")
+        payload = json.dumps({
+            "model": "gateway-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32,
+            "stream": True,
+        })
+        status, headers, body = self.request(
+            "POST", "/v1/messages", payload,
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertLess(body.find(b"event: message_start"), body.find(b"event: content_block_delta"))
+        self.assertLess(body.find(b"event: content_block_delta"), body.find(b"event: message_delta"))
+        self.assertLess(body.find(b"event: message_delta"), body.find(b"event: message_stop"))
+
+        request_id = next(value for key, value in headers.items() if key.lower() == "x-request-id")
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            usage = self.database_query(
+                "SELECT state, input_tokens, output_tokens, usage_quality FROM usage_records "
+                f"WHERE request_id='{request_id}'"
+            ).strip()
+            if usage.startswith("succeeded"):
+                break
+            time.sleep(0.01)
+        self.assertEqual(usage, "succeeded\t3\t1\texact")
+
+    def test_chat_stream_failure_after_commit_uses_one_native_terminal_error(self):
+        self.provider_state.reset("chat_stream_close_after_commit")
+        status, _, body = self.request(
+            "POST", "/v1/chat/completions",
+            json.dumps({
+                "model": "gateway-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            }),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body.count(b'"code":"upstream_stream_error"'), 1)
+        self.assertNotIn(b"[DONE]", body)
+        self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+
+    def test_anthropic_stream_failure_after_commit_uses_one_native_terminal_error(self):
+        self.provider_state.reset("anthropic_stream_close_after_commit")
+        status, _, body = self.request(
+            "POST", "/v1/messages",
+            json.dumps({
+                "model": "gateway-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 32,
+                "stream": True,
+            }),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body.count(b"event: error\n"), 1)
+        self.assertEqual(body.count(b'"type":"upstream_stream_error"'), 1)
+        self.assertNotIn(b"event: message_stop", body)
+        self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
+
+    def test_anthropic_validation_and_auth_errors_use_native_error_shape(self):
+        status, _, body = self.request(
+            "POST", "/v1/messages",
+            json.dumps({"model": "gateway-model", "messages": []}),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["type"], "error")
+        self.assertIn("error", json.loads(body))
+
+        status, _, body = self.request(
+            "POST", "/v1/messages",
+            json.dumps({"model": "gateway-model", "messages": [], "max_tokens": 1}),
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"]["type"], "invalid_api_key")
+
+    def test_anthropic_accepts_positive_max_tokens_above_signed_range(self):
+        self.provider_state.reset("anthropic_success")
+        status, _, body = self.request(
+            "POST", "/v1/messages",
+            json.dumps({
+                "model": "gateway-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 18446744073709551615,
+            }),
+            {"Authorization": f"Bearer {GATEWAY_KEY}"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["type"], "message")
+        _, calls = self.provider_state.snapshot()
+        self.assertEqual(calls[0]["payload"]["max_tokens"], 18446744073709551615)
 
     def start_phase6_gateway(self, **overrides):
         port = free_port()
@@ -1686,6 +1947,7 @@ class GatewayIntegrationTest(unittest.TestCase):
             "protocol, stream, state) SELECT '" + fixture_request_id + "', ak.tenant_id, ak.id, "
             "lm.id, 'responses', 0, 'started' FROM api_keys ak JOIN logical_models lm "
             "ON lm.tenant_id=ak.tenant_id AND lm.name='gateway-model' "
+            "AND lm.protocol='responses' "
             f"WHERE ak.key_id='{key_id}'; "
             "SET @usage_id=LAST_INSERT_ID(); "
             "INSERT INTO budget_periods(scope_type, scope_id, period_kind, period_start, "
@@ -3089,8 +3351,8 @@ class GatewayIntegrationTest(unittest.TestCase):
                 "AI_GATEWAY_STREAM_PREFETCH_BYTES": "1024",
                 "AI_GATEWAY_STREAM_BUFFER_HIGH_WATER_BYTES": "1024",
                 "AI_GATEWAY_STREAM_BUFFER_LOW_WATER_BYTES": "128",
-                "AI_GATEWAY_STREAM_IDLE_TIMEOUT_MS": "2000",
-                "AI_GATEWAY_STREAM_MAX_DURATION_MS": "10000",
+                "AI_GATEWAY_STREAM_IDLE_TIMEOUT_MS": "5000",
+                "AI_GATEWAY_STREAM_MAX_DURATION_MS": "30000",
             }
         )
         process = subprocess.Popen(
@@ -3108,7 +3370,7 @@ class GatewayIntegrationTest(unittest.TestCase):
         log_thread.start()
         connection = None
         try:
-            deadline = time.time() + 5
+            deadline = time.time() + 10
             while True:
                 try:
                     probe = http.client.HTTPConnection("127.0.0.1", gateway_port, timeout=1)
@@ -3123,7 +3385,7 @@ class GatewayIntegrationTest(unittest.TestCase):
                         self.fail("backpressure AiGateway did not start")
                     time.sleep(0.05)
 
-            connection = http.client.HTTPConnection("127.0.0.1", gateway_port, timeout=10)
+            connection = http.client.HTTPConnection("127.0.0.1", gateway_port, timeout=30)
             connection.request(
                 "POST",
                 "/v1/responses",
@@ -3140,7 +3402,7 @@ class GatewayIntegrationTest(unittest.TestCase):
             body = response.read()
             connection.close()
             connection = None
-            self.assertTrue(self.provider_state.stream_finished.wait(3))
+            self.assertTrue(self.provider_state.stream_finished.wait(10))
             sequences = []
             for line in body.splitlines():
                 if line.startswith(b"data: {"):

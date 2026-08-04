@@ -2,6 +2,7 @@
 #include "gateway/governance.hpp"
 #include "gateway/lifecycle.hpp"
 #include "gateway/metrics.hpp"
+#include "gateway/protocol.hpp"
 #include "gateway/runtime.hpp"
 #include "gateway/routing.hpp"
 
@@ -15,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -241,29 +243,6 @@ void finish_without_attempt(RuntimeState &runtime,
         });
 }
 
-HeaderMap upstream_headers(const GatewayRequest &request,
-                           const ModelTarget &target,
-                           bool stream)
-{
-    static const char *allowed[] = {
-        "user-agent", "openai-beta", "originator", "session-id",
-        "thread-id", "x-client-request-id"};
-
-    HeaderMap headers{{"authorization", "Bearer " + target.provider_api_key},
-                      {"content-type", "application/json"},
-                      {"accept", stream ? "text/event-stream" : "application/json"},
-                      {"x-request-id", request.request_id}};
-    for (const char *name : allowed)
-    {
-        const auto found = request.headers.find(name);
-        if (found != request.headers.end())
-        {
-            headers[name] = found->second;
-        }
-    }
-    return headers;
-}
-
 bool valid_retry_after(const std::string &value)
 {
     return !value.empty() && value.size() <= 10 &&
@@ -287,6 +266,7 @@ struct SseRecord
     SseRecordKind kind = SseRecordKind::invalid;
     long sequence_number = -1;
     json payload;
+    UsageAccounting usage;
 };
 
 std::size_t sse_record_end(const std::string &buffer)
@@ -432,6 +412,12 @@ SseRecord classify_sse_record(std::string raw)
 class SseDecoder
 {
 public:
+    explicit SseDecoder(const ProtocolAdapter *adapter = nullptr,
+                        const std::vector<ModelPrice> *prices = nullptr)
+        : adapter_(adapter), prices_(prices)
+    {
+    }
+
     std::vector<SseRecord> push(std::string_view bytes)
     {
         buffer_.append(bytes.data(), bytes.size());
@@ -443,7 +429,22 @@ public:
             {
                 break;
             }
-            records.push_back(classify_sse_record(buffer_.substr(0, end)));
+            const std::string raw = buffer_.substr(0, end);
+            if (adapter_ != nullptr && prices_ != nullptr)
+            {
+                const ProtocolEvent event = adapter_->classify_event(raw, *prices_);
+                SseRecord record;
+                record.raw = raw;
+                record.kind = static_cast<SseRecordKind>(event.kind);
+                record.sequence_number = event.sequence_number;
+                record.payload = event.payload;
+                record.usage = event.usage;
+                records.push_back(std::move(record));
+            }
+            else
+            {
+                records.push_back(classify_sse_record(raw));
+            }
             buffer_.erase(0, end);
         }
         return records;
@@ -461,19 +462,9 @@ public:
 
 private:
     std::string buffer_;
+    const ProtocolAdapter *adapter_ = nullptr;
+    const std::vector<ModelPrice> *prices_ = nullptr;
 };
-
-std::string stream_terminal_error(long sequence_number,
-                                  const std::string &code,
-                                  const std::string &message = "Upstream provider stream failed")
-{
-    json payload = {{"type", "error"},
-                    {"code", code},
-                    {"message", message},
-                    {"param", nullptr},
-                    {"sequence_number", std::max<long>(0, sequence_number)}};
-    return "event: error\ndata: " + payload.dump() + "\n\n";
-}
 
 bool is_event_stream(const HeaderMap &headers)
 {
@@ -744,6 +735,7 @@ public:
                      ResponseWriter &response,
                      CancellationToken cancellation,
                      GatewayConfig config,
+                     const ProtocolAdapter &adapter,
                      json payload,
                      std::vector<ModelTarget> candidates,
                      std::string affinity_key,
@@ -765,6 +757,7 @@ public:
           governance_(governance),
           metrics_(metrics),
           transport_(transport),
+          adapter_(&adapter),
           request_(std::move(request)),
           response_(response),
           cancellation_(std::move(cancellation)),
@@ -1021,7 +1014,7 @@ private:
         upstream_payload["model"] = current_target_.upstream_model;
         ProviderRequest provider_request;
         provider_request.url = current_target_.provider_url;
-        provider_request.headers = upstream_headers(request_, current_target_, stream_);
+        provider_request.headers = adapter_->provider_headers(request_, current_target_, stream_);
         provider_request.body = upstream_payload.dump();
         provider_request.max_response_bytes = remaining_response_bytes();
         provider_request.timeout_ms = config_.upstream_timeout_ms;
@@ -1133,11 +1126,13 @@ private:
                                                     ? "upstream_unavailable"
                                                     : "upstream_rejected_request");
         decision.client_status = status >= 400 && status < 500 ? static_cast<int>(status) : 502;
-        decision.client_body = openai_error_body(
-            status >= 400 && status < 500 ? "Upstream provider rejected the request"
-                                          : "Upstream provider returned an invalid status",
+        const ProtocolError error = protocol_error(
+            decision.client_status,
             status >= 400 && status < 500 ? "upstream_error" : "server_error",
-            decision.error_class);
+            decision.error_class,
+            status >= 400 && status < 500 ? "Upstream provider rejected the request"
+                                          : "Upstream provider returned an invalid status");
+        decision.client_body = adapter_->error_body(error);
         const auto retry_after = headers.find("retry-after");
         if (retry_after != headers.end() && valid_retry_after(retry_after->second))
         {
@@ -1183,25 +1178,27 @@ private:
             try
             {
                 json response_json = json::parse(upstream.body);
-                if (!response_json.is_object())
-                {
-                    throw json::type_error::create(302, "response is not an object");
-                }
-                if (response_json.contains("model"))
-                {
-                    response_json["model"] = logical_model_;
-                }
-                decision.state = "succeeded";
-                decision.error_class = "success";
-                decision.success = true;
                 decision.provider_status = upstream.status;
-                decision.client_status = static_cast<int>(upstream.status);
-                decision.client_body = response_json.dump();
                 decision.upstream_bytes = attempt_upstream_bytes_;
-                if (response_json.contains("usage"))
+                ProtocolError protocol_failure;
+                if (!adapter_->normalize_response(response_json, logical_model_,
+                                                  current_target_.prices,
+                                                  decision.client_body, decision.usage,
+                                                  protocol_failure))
                 {
-                    decision.usage = usage_accounting(response_json["usage"],
-                                                       current_target_.prices);
+                    decision.state = "failed";
+                    decision.error_class = protocol_failure.code.empty()
+                                               ? "upstream_invalid_response"
+                                               : protocol_failure.code;
+                    decision.retryable = true;
+                    decision.possible_duplicate_cost = true;
+                }
+                else
+                {
+                    decision.state = "succeeded";
+                    decision.error_class = "success";
+                    decision.success = true;
+                    decision.client_status = static_cast<int>(upstream.status);
                 }
             }
             catch (const json::exception &)
@@ -1479,7 +1476,7 @@ private:
              {"response_bytes", std::to_string(decision.upstream_bytes)},
              {"duration_ms", std::to_string(std::max<long long>(0, duration_ms))}});
         metrics_.attempt_completed(
-            tenant_slug_, "responses", logical_model_, current_target_.provider_slug,
+            tenant_slug_, adapter_->protocol(), logical_model_, current_target_.provider_slug,
             current_target_.credential_name, decision.state, decision.error_class,
             decision.usage, decision.first_byte_ms,
             static_cast<std::uint64_t>(std::max<long long>(0, duration_ms)));
@@ -1636,8 +1633,8 @@ private:
         const std::string code = decision.error_class.empty()
                                      ? "upstream_unavailable"
                                      : decision.error_class;
-        const std::string body = openai_error_body(
-            "Upstream provider request failed", "server_error", code);
+        const std::string body = adapter_->error_body(protocol_error(
+            502, "server_error", code, "Upstream provider request failed"));
         write_response(response_, 502, request_.request_id, body);
         finalize_log(502, code, body.size());
     }
@@ -1650,9 +1647,9 @@ private:
         }
         if (!terminal_error_written_)
         {
-            const std::string event = stream_terminal_error(
+            const std::string event = adapter_->terminal_error(
                 std::max<long>(stream_last_sequence_number_ + 1, 1),
-                "upstream_stream_error");
+                "upstream_stream_error", "Upstream provider stream failed");
             downstream_response_bytes_ += event.size();
             response_.write(event);
             terminal_error_written_ = true;
@@ -1667,7 +1664,8 @@ private:
         {
             return;
         }
-        const std::string body = openai_error_body(message, "server_error", code);
+        const std::string body = adapter_->error_body(
+            protocol_error(503, "server_error", code, message));
         write_response(response_, 503, request_.request_id, body);
         finalize_log(503, code, body.size());
     }
@@ -1678,9 +1676,9 @@ private:
         {
             return;
         }
-        const std::string body = openai_error_body(
-            "All provider credentials are currently quota limited",
-            "rate_limit_error", "credential_quota_exceeded");
+        const std::string body = adapter_->error_body(protocol_error(
+            429, "rate_limit_error", "credential_quota_exceeded",
+            "All provider credentials are currently quota limited"));
         HeaderMap headers;
         if (credential_retry_after_ms_ > 0)
         {
@@ -1711,7 +1709,7 @@ private:
         {
             if (!terminal_error_written_)
             {
-                const std::string event = stream_terminal_error(
+                const std::string event = adapter_->terminal_error(
                     std::max<long>(stream_last_sequence_number_ + 1, 1),
                     "gateway_shutdown", "Gateway node is shutting down");
                 downstream_response_bytes_ += event.size();
@@ -1722,8 +1720,8 @@ private:
             finalize_log(200, "gateway_shutdown", 0, "cancelled");
             return;
         }
-        const std::string body = openai_error_body(
-            "Gateway node is shutting down", "server_error", "gateway_shutdown");
+        const std::string body = adapter_->error_body(protocol_error(
+            503, "server_error", "gateway_shutdown", "Gateway node is shutting down"));
         write_response(response_, 503, request_.request_id, body, {{"retry-after", "1"}});
         finalize_log(503, "gateway_shutdown", body.size(), "cancelled");
     }
@@ -1781,7 +1779,7 @@ private:
         }
         finish.usage = aggregate_usage_;
         metrics_.request_completed(
-            tenant_slug_, "responses", logical_model_, status, provider_result,
+            tenant_slug_, adapter_->protocol(), logical_model_, status, provider_result,
             finish.duration_ms,
             provider_attempt_count_ > 0 ? provider_attempt_count_ - 1 : 0, pauses_);
         auto permit = std::move(governance_permit_);
@@ -1809,7 +1807,7 @@ private:
     {
         attempt_started_in_database_ = false;
         attempt_upstream_bytes_ = 0;
-        stream_decoder_ = SseDecoder();
+        stream_decoder_ = SseDecoder(adapter_, &current_target_.prices);
         stream_usage_ = UsageAccounting();
         stream_headers_.clear();
         stream_precommit_records_.clear();
@@ -1851,16 +1849,33 @@ private:
             stream_last_sequence_number_ = std::max(stream_last_sequence_number_,
                                                     record.sequence_number);
         }
+        if (record.usage.input_tokens)
+        {
+            stream_usage_.input_tokens = record.usage.input_tokens;
+        }
+        if (record.usage.cached_input_tokens)
+        {
+            stream_usage_.cached_input_tokens = record.usage.cached_input_tokens;
+        }
+        if (record.usage.output_tokens)
+        {
+            stream_usage_.output_tokens = record.usage.output_tokens;
+        }
+        if (stream_usage_.input_tokens && stream_usage_.output_tokens)
+        {
+            json usage = {{"input_tokens", *stream_usage_.input_tokens},
+                          {"output_tokens", *stream_usage_.output_tokens},
+                          {"input_tokens_details",
+                           {{"cached_tokens", stream_usage_.cached_input_tokens.value_or(0)}}}};
+            stream_usage_ = usage_accounting(usage, current_target_.prices);
+        }
+        else if (stream_usage_.input_tokens || stream_usage_.output_tokens)
+        {
+            stream_usage_.usage_quality = "partial";
+        }
         if (record.kind == SseRecordKind::success_terminal)
         {
             stream_success_terminal_seen_ = true;
-            if (record.payload.is_object() && record.payload.contains("response") &&
-                record.payload["response"].is_object() &&
-                record.payload["response"].contains("usage"))
-            {
-                stream_usage_ = usage_accounting(
-                    record.payload["response"]["usage"], current_target_.prices);
-            }
         }
         downstream_response_bytes_ += record.raw.size();
         if (!response_.write(record.raw))
@@ -1881,6 +1896,7 @@ private:
     GovernanceRuntime &governance_;
     MetricsRegistry &metrics_;
     ProviderTransport &transport_;
+    const ProtocolAdapter *adapter_ = nullptr;
     GatewayRequest request_;
     ResponseWriter &response_;
     CancellationToken cancellation_;
@@ -2037,11 +2053,19 @@ void AiGateway::handle(const GatewayRequest &request,
         response.end();
         return;
     }
+    const ProtocolAdapter *request_adapter =
+        find_protocol_adapter(request.method, request.path);
+    const auto auth_error_body = [request_adapter](ProtocolError error) {
+        return request_adapter != nullptr
+                   ? request_adapter->error_body(error)
+                   : openai_error_body(error.message, error.type, error.code,
+                                       error.param.empty() ? std::string() : error.param);
+    };
     std::string token;
     if (!bearer_token(request, token))
     {
-        const std::string body = openai_error_body(
-            "Invalid API key", "authentication_error", "invalid_api_key");
+        const std::string body = auth_error_body(protocol_error(
+            401, "authentication_error", "invalid_api_key", "Invalid API key"));
         write_response(response, 401, request.request_id, body,
                        {{"www-authenticate", "Bearer"}});
         log_completion(request, 401, started, {}, "not_attempted", body.size());
@@ -2050,7 +2074,8 @@ void AiGateway::handle(const GatewayRequest &request,
 
     runtime_.authenticate(
         std::move(token),
-        [this, request, &response, cancellation, started](AuthResult result) mutable {
+        [this, request, &response, cancellation, started, request_adapter,
+         auth_error_body](AuthResult result) mutable {
             if (cancellation.is_cancelled() || !response.client_connected())
             {
                 response.end();
@@ -2059,8 +2084,8 @@ void AiGateway::handle(const GatewayRequest &request,
             }
             if (result.status == AuthStatus::invalid_api_key)
             {
-                const std::string body = openai_error_body(
-                    "Invalid API key", "authentication_error", "invalid_api_key");
+                const std::string body = auth_error_body(protocol_error(
+                    401, "authentication_error", "invalid_api_key", "Invalid API key"));
                 write_response(response, 401, request.request_id, body,
                                {{"www-authenticate", "Bearer"}});
                 log_completion(request, 401, started, {}, "not_attempted", body.size());
@@ -2068,17 +2093,17 @@ void AiGateway::handle(const GatewayRequest &request,
             }
             if (result.status == AuthStatus::access_disabled)
             {
-                const std::string body = openai_error_body(
-                    "Access is disabled", "permission_error", "access_disabled");
+                const std::string body = auth_error_body(protocol_error(
+                    403, "permission_error", "access_disabled", "Access is disabled"));
                 write_response(response, 403, request.request_id, body);
                 log_completion(request, 403, started, {}, "not_attempted", body.size());
                 return;
             }
             if (result.status != AuthStatus::authorized || !result.snapshot)
             {
-                const std::string body = openai_error_body(
-                    "Gateway authorization is unavailable", "server_error",
-                    "authorization_unavailable");
+                const std::string body = auth_error_body(protocol_error(
+                    503, "server_error", "authorization_unavailable",
+                    "Gateway authorization is unavailable"));
                 write_response(response, 503, request.request_id, body);
                 log_completion(request, 503, started, {}, "not_attempted", body.size());
                 return;
@@ -2097,22 +2122,24 @@ void AiGateway::handle_authorized(GatewayRequest request,
     const GatewayConfig &config = runtime_.config();
     const std::string &tenant_slug = snapshot->tenant_slug;
     const std::string &api_key_id = snapshot->public_api_key_id;
+    const ProtocolAdapter *adapter = find_protocol_adapter(request.method, request.path);
+    const auto error_body = [adapter](ProtocolError error) {
+        return adapter != nullptr
+                   ? adapter->error_body(error)
+                   : openai_error_body(error.message, error.type, error.code,
+                                       error.param.empty() ? std::string() : error.param);
+    };
     if (request.method == "GET" && request.path == "/v1/models")
     {
-        std::vector<std::string> model_names;
-        if (snapshot->protocols.count("responses") != 0)
+        std::set<std::string> model_names;
+        for (const auto &entry : snapshot->models)
         {
-            for (const auto &entry : snapshot->models)
+            const ModelAccess &access = entry.second;
+            if (access.model_granted && !access.candidates.empty())
             {
-                const ModelAccess &access = entry.second;
-                if (access.protocol == "responses" && access.model_granted &&
-                    !access.candidates.empty())
-                {
-                    model_names.push_back(access.name);
-                }
+                model_names.insert(access.name);
             }
         }
-        std::sort(model_names.begin(), model_names.end());
         json data = json::array();
         for (const auto &name : model_names)
         {
@@ -2126,19 +2153,19 @@ void AiGateway::handle_authorized(GatewayRequest request,
                        tenant_slug, api_key_id);
         return;
     }
-    if (request.method != "POST" || request.path != "/v1/responses")
+    if (adapter == nullptr)
     {
-        const std::string body = openai_error_body(
-            "Endpoint not found", "invalid_request_error", "not_found");
+        const std::string body = error_body(protocol_error(
+            404, "invalid_request_error", "not_found", "Endpoint not found"));
         write_response(response, 404, request.request_id, body);
         log_completion(request, 404, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
         return;
     }
-    if (snapshot->protocols.count("responses") == 0)
+    if (snapshot->protocols.count(adapter->protocol()) == 0)
     {
-        const std::string body = openai_error_body(
-            "Protocol is not allowed", "permission_error", "protocol_not_allowed");
+        const std::string body = error_body(protocol_error(
+            403, "permission_error", "protocol_not_allowed", "Protocol is not allowed"));
         write_response(response, 403, request.request_id, body);
         log_completion(request, 403, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
@@ -2146,8 +2173,8 @@ void AiGateway::handle_authorized(GatewayRequest request,
     }
     if (request.body.size() > config.max_body_bytes)
     {
-        const std::string body = openai_error_body(
-            "Request body is too large", "invalid_request_error", "body_too_large");
+        const std::string body = error_body(protocol_error(
+            413, "invalid_request_error", "body_too_large", "Request body is too large"));
         write_response(response, 413, request.request_id, body);
         log_completion(request, 413, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
@@ -2157,9 +2184,9 @@ void AiGateway::handle_authorized(GatewayRequest request,
     if (content_type == request.headers.end() ||
         lower(content_type->second).rfind("application/json", 0) != 0)
     {
-        const std::string body = openai_error_body(
-            "Content-Type must be application/json", "invalid_request_error",
-            "invalid_content_type", "content-type");
+        const std::string body = error_body(protocol_error(
+            400, "invalid_request_error", "invalid_content_type",
+            "Content-Type must be application/json", "content-type"));
         write_response(response, 400, request.request_id, body);
         log_completion(request, 400, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
@@ -2172,30 +2199,30 @@ void AiGateway::handle_authorized(GatewayRequest request,
     }
     catch (const json::exception &)
     {
-        const std::string body = openai_error_body(
-            "Request body must be valid JSON", "invalid_request_error", "invalid_json");
+        const std::string body = error_body(protocol_error(
+            400, "invalid_request_error", "invalid_json", "Request body must be valid JSON"));
         write_response(response, 400, request.request_id, body);
         log_completion(request, 400, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
         return;
     }
-    if (!payload.is_object() || !payload.contains("model") || !payload["model"].is_string() ||
-        payload["model"].get<std::string>().empty())
+    ProtocolRequestContext protocol_context;
+    ProtocolError validation_error;
+    if (!adapter->validate_request(payload, protocol_context, validation_error))
     {
-        const std::string body = openai_error_body(
-            "model must be a non-empty string", "invalid_request_error", "invalid_model", "model");
+        const std::string body = error_body(validation_error);
         write_response(response, 400, request.request_id, body);
         log_completion(request, 400, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
         return;
     }
-    const std::string logical_model = payload["model"].get<std::string>();
-    const auto model = snapshot->models.find("responses\x1f" + logical_model);
+    const std::string logical_model = protocol_context.model;
+    const auto model = snapshot->models.find(adapter->protocol() + "\x1f" + logical_model);
     if (model == snapshot->models.end() || !model->second.model_granted ||
         (model->second.provider_denied && model->second.candidates.empty()))
     {
-        const std::string body = openai_error_body(
-            "Model is not allowed", "permission_error", "model_not_allowed", "model");
+        const std::string body = error_body(protocol_error(
+            403, "permission_error", "model_not_allowed", "Model is not allowed", "model"));
         write_response(response, 403, request.request_id, body);
         log_completion(request, 403, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);
@@ -2203,32 +2230,23 @@ void AiGateway::handle_authorized(GatewayRequest request,
     }
     if (model->second.candidates.empty())
     {
-        const std::string body = openai_error_body(
-            "Model is temporarily unavailable", "server_error", "model_unavailable", "model");
+        const std::string body = error_body(protocol_error(
+            503, "server_error", "model_unavailable",
+            "Model is temporarily unavailable", "model"));
         write_response(response, 503, request.request_id, body);
         log_completion(request, 503, started, logical_model, "not_attempted", body.size(), false,
                        0, tenant_slug, api_key_id);
         return;
     }
-    if (payload.contains("stream") && !payload["stream"].is_boolean())
-    {
-        const std::string body = openai_error_body(
-            "stream must be a boolean", "invalid_request_error", "invalid_stream", "stream");
-        write_response(response, 400, request.request_id, body);
-        log_completion(request, 400, started, logical_model, "not_attempted", body.size(), false,
-                       0, tenant_slug, api_key_id);
-        return;
-    }
-
-    const bool stream = payload.value("stream", false);
+    const bool stream = protocol_context.stream;
     NodeAdmission node_admission = lifecycle_.admit(stream);
     if (node_admission.status != NodeAdmissionStatus::admitted || !node_admission.lease)
     {
         const bool draining = node_admission.status == NodeAdmissionStatus::draining;
         const std::string code = draining ? "gateway_draining" : "gateway_overloaded";
-        const std::string body = openai_error_body(
-            draining ? "Gateway node is draining" : "Gateway node is at capacity",
-            "server_error", code);
+        const std::string body = error_body(protocol_error(
+            503, "server_error", code,
+            draining ? "Gateway node is draining" : "Gateway node is at capacity"));
         write_response(response, 503, request.request_id, body, {{"retry-after", "1"}});
         log_completion(request, 503, started, logical_model, code, body.size(), stream, 0,
                        tenant_slug, api_key_id);
@@ -2258,21 +2276,16 @@ void AiGateway::handle_authorized(GatewayRequest request,
             break;
         }
     }
-    if (session_hint.empty() && payload.contains("prompt_cache_key") &&
-        payload["prompt_cache_key"].is_string())
+    if (session_hint.empty())
     {
-        const std::string value = payload["prompt_cache_key"].get<std::string>();
-        if (!value.empty() && value.size() <= 1024)
-        {
-            session_hint = value;
-        }
+        session_hint = adapter->session_hint(payload);
     }
 
     RouteRequest route_request;
     route_request.request_id = request.request_id;
     route_request.config_version = snapshot->config_version;
     route_request.public_api_key_id = api_key_id;
-    route_request.protocol = "responses";
+    route_request.protocol = adapter->protocol();
     route_request.logical_model = logical_model;
     route_request.scheduling_mode = model->second.scheduling_mode;
     route_request.max_attempts = model->second.max_attempts;
@@ -2299,7 +2312,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
     request_admission.tenant_id = tenant_database_id;
     request_admission.api_key_id = api_key_database_id;
     request_admission.logical_model_id = model_database_id;
-    request_admission.protocol = "responses";
+    request_admission.protocol = adapter->protocol();
     request_admission.stream = stream;
     request_admission.request_bytes = request.body.size();
     request_admission.max_attempts = max_attempts;
@@ -2314,7 +2327,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
          tenant_database_id, api_key_database_id, model_database_id,
          payload = std::move(payload), route_request = std::move(route_request),
          request_admission = std::move(request_admission), max_attempts,
-         lease_loss, node_lease, node_guard](GovernanceResult admission) mutable {
+         lease_loss, node_lease, node_guard, adapter](GovernanceResult admission) mutable {
             if (cancellation.is_cancelled() || !response.client_connected())
             {
                 governance_.release(admission.permit);
@@ -2344,7 +2357,8 @@ void AiGateway::handle_authorized(GatewayRequest request,
                     message = "Concurrent request limit exceeded";
                 }
                 metrics_.governance_rejected(code);
-                const std::string body = openai_error_body(message, type, code);
+                const std::string body = adapter->error_body(
+                    protocol_error(status, type, code, message));
                 HeaderMap headers;
                 if (admission.retry_after_ms > 0)
                 {
@@ -2363,7 +2377,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                  tenant_database_id, api_key_database_id, model_database_id,
                  payload = std::move(payload), permit = std::move(admission.permit),
                  route_request = std::move(route_request), lease_loss,
-                 max_attempts, node_lease, node_guard](RequestAdmissionStatus request_status) mutable {
+                 max_attempts, node_lease, node_guard, adapter](RequestAdmissionStatus request_status) mutable {
                     if (request_status != RequestAdmissionStatus::admitted)
                     {
                         const bool budget = request_status ==
@@ -2374,17 +2388,18 @@ void AiGateway::handle_authorized(GatewayRequest request,
                             std::move(permit),
                             [request = std::move(request), &response, started,
                              logical_model, tenant_slug, api_key_id, stream,
-                             budget, node_guard](bool rolled_back) mutable {
+                             budget, node_guard, adapter](bool rolled_back) mutable {
                                 const bool budget_error = budget && rolled_back;
                                 const int status = budget_error ? 429 : 503;
                                 const std::string code = budget_error
                                                              ? "budget_exceeded"
                                                              : "governance_unavailable";
-                                const std::string body = openai_error_body(
-                                    budget_error ? "Request budget is exhausted"
-                                                 : "Gateway governance is unavailable",
+                                const std::string body = adapter->error_body(protocol_error(
+                                    status,
                                     budget_error ? "insufficient_quota" : "server_error",
-                                    code);
+                                    code,
+                                    budget_error ? "Request budget is exhausted"
+                                                 : "Gateway governance is unavailable"));
                                 write_response(response, status, request.request_id, body);
                                 log_completion(request, status, started, logical_model, code,
                                                body.size(), stream, 0, tenant_slug, api_key_id);
@@ -2407,7 +2422,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                          tenant_database_id, api_key_database_id, model_database_id,
                          payload = std::move(payload), permit = std::move(permit),
                          lease_loss, max_attempts, node_lease,
-                         node_guard](RoutePlan plan) mutable {
+                         node_guard, adapter](RoutePlan plan) mutable {
                             if (cancellation.is_cancelled() || !response.client_connected())
                             {
                                 response.end();
@@ -2419,9 +2434,9 @@ void AiGateway::handle_authorized(GatewayRequest request,
                             }
                             if (plan.status == RouteStatus::unavailable)
                             {
-                                const std::string body = openai_error_body(
-                                    "Gateway routing is unavailable", "server_error",
-                                    "routing_unavailable");
+                                const std::string body = adapter->error_body(protocol_error(
+                                    503, "server_error", "routing_unavailable",
+                                    "Gateway routing is unavailable"));
                                 write_response(response, 503, request.request_id, body);
                                 finish_without_attempt(
                                     runtime_, governance_, std::move(permit), std::move(request),
@@ -2432,9 +2447,9 @@ void AiGateway::handle_authorized(GatewayRequest request,
                             }
                             if (plan.status != RouteStatus::ready || plan.candidates.empty())
                             {
-                                const std::string body = openai_error_body(
-                                    "Model is temporarily unavailable", "server_error",
-                                    "model_unavailable", "model");
+                                const std::string body = adapter->error_body(protocol_error(
+                                    503, "server_error", "model_unavailable",
+                                    "Model is temporarily unavailable", "model"));
                                 write_response(response, 503, request.request_id, body);
                                 finish_without_attempt(
                                     runtime_, governance_, std::move(permit), std::move(request),
@@ -2445,7 +2460,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
 
                             auto execution = std::make_shared<RequestExecution>(
                                 runtime_, routing_, governance_, metrics_, transport_,
-                                std::move(request), response, cancellation, config,
+                                std::move(request), response, cancellation, config, *adapter,
                                 std::move(payload),
                                 std::move(plan.candidates), std::move(plan.affinity_key),
                                 logical_model, tenant_slug, api_key_id, tenant_database_id,

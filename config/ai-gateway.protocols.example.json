@@ -1,0 +1,48 @@
+{
+  "tenants": [{"slug": "example", "name": "Example Tenant", "status": "active"}],
+  "providers": [{
+    "tenant": "example",
+    "slug": "local-mock",
+    "name": "Local Mock Provider",
+    "status": "active",
+    "endpoints": [
+      {"name": "responses", "protocol": "responses",
+       "url": "http://127.0.0.1:19090/v1/responses", "status": "active"},
+      {"name": "chat", "protocol": "chat_completions",
+       "url": "http://127.0.0.1:19090/v1/chat/completions", "status": "active"},
+      {"name": "messages", "protocol": "anthropic_messages",
+       "url": "http://127.0.0.1:19090/v1/messages", "status": "active"}
+    ],
+    "credentials": [{"name": "default", "secret_ref": "env:MOCK_PROVIDER_API_KEY",
+                      "status": "active"}]
+  }],
+  "logical_models": [
+    {"tenant": "example", "protocol": "responses", "name": "gateway-model", "status": "active"},
+    {"tenant": "example", "protocol": "chat_completions", "name": "gateway-model", "status": "active"},
+    {"tenant": "example", "protocol": "anthropic_messages", "name": "gateway-model", "status": "active"}
+  ],
+  "policies": [{
+    "tenant": "example",
+    "slug": "default",
+    "name": "Default",
+    "status": "active",
+    "protocols": ["responses", "chat_completions", "anthropic_messages"],
+    "models": [
+      "gateway-model",
+      {"protocol": "chat_completions", "name": "gateway-model"},
+      {"protocol": "anthropic_messages", "name": "gateway-model"}
+    ],
+    "providers": ["local-mock"]
+  }],
+  "mappings": [
+    {"tenant": "example", "protocol": "responses", "logical_model": "gateway-model",
+     "name": "responses-primary", "provider": "local-mock", "endpoint": "responses",
+     "credential": "default", "upstream_model": "gpt-5.6-terra", "status": "active"},
+    {"tenant": "example", "protocol": "chat_completions", "logical_model": "gateway-model",
+     "name": "chat-primary", "provider": "local-mock", "endpoint": "chat",
+     "credential": "default", "upstream_model": "gpt-5.6-terra", "status": "active"},
+    {"tenant": "example", "protocol": "anthropic_messages", "logical_model": "gateway-model",
+     "name": "anthropic-primary", "provider": "local-mock", "endpoint": "messages",
+     "credential": "default", "upstream_model": "claude-sonnet", "status": "active"}
+  ]
+}

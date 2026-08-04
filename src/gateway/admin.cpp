@@ -1,5 +1,6 @@
 #include "gateway/gateway.hpp"
 #include "gateway/mysql.hpp"
+#include "gateway/protocol.hpp"
 
 #include "json.hpp"
 
@@ -423,6 +424,10 @@ void apply_config(MySqlConnection &connection, const json &root)
             const std::string url = required_string(endpoint, "url");
             validate_name(name, "Endpoint name");
             validate_name(protocol, "protocol");
+            if (!ai_gateway::is_supported_protocol(protocol))
+            {
+                throw std::runtime_error("unsupported Gateway protocol: " + protocol);
+            }
             validate_url(url);
             upsert(connection,
                 "INSERT INTO provider_endpoints(provider_id, name, protocol, url, status) "
@@ -549,6 +554,10 @@ void apply_config(MySqlConnection &connection, const json &root)
         const std::string protocol = required_string(model, "protocol");
         const std::string name = required_string(model, "name");
         validate_name(protocol, "protocol");
+        if (!ai_gateway::is_supported_protocol(protocol))
+        {
+            throw std::runtime_error("unsupported Gateway protocol: " + protocol);
+        }
         validate_name(name, "Logical Model name");
         const auto tenant_id = require_id(connection,
             "SELECT id FROM tenants WHERE slug = ?", {tenant_slug}, tenant_slug);
@@ -606,6 +615,10 @@ void apply_config(MySqlConnection &connection, const json &root)
         {
             const auto grant = grant_value(entry);
             validate_name(grant.first, "protocol");
+            if (!ai_gateway::is_supported_protocol(grant.first))
+            {
+                throw std::runtime_error("unsupported Gateway protocol: " + grant.first);
+            }
             upsert(connection,
                 "INSERT INTO policy_protocol_grants(policy_id, protocol, enabled) VALUES (?, ?, ?) "
                 "ON DUPLICATE KEY UPDATE enabled=VALUES(enabled)",
@@ -629,6 +642,10 @@ void apply_config(MySqlConnection &connection, const json &root)
             else
             {
                 throw std::runtime_error("model grant must be a name or object");
+            }
+            if (!ai_gateway::is_supported_protocol(protocol))
+            {
+                throw std::runtime_error("unsupported Gateway protocol: " + protocol);
             }
             const auto model_id = require_id(connection,
                 "SELECT id FROM logical_models WHERE tenant_id = ? AND protocol = ? AND name = ?",
@@ -656,6 +673,10 @@ void apply_config(MySqlConnection &connection, const json &root)
     {
         const std::string tenant_slug = required_string(mapping, "tenant");
         const std::string protocol = required_string(mapping, "protocol");
+        if (!ai_gateway::is_supported_protocol(protocol))
+        {
+            throw std::runtime_error("unsupported Gateway protocol: " + protocol);
+        }
         const std::string model_name = required_string(mapping, "logical_model");
         const std::string provider_slug = required_string(mapping, "provider");
         const auto tenant_id = require_id(connection,
