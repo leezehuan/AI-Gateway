@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Gateway instance %i
+After=network-online.target mariadb.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-gateway
+Group=ai-gateway
+EnvironmentFile=/etc/ai-gateway/ai-gateway.env
+EnvironmentFile=/etc/ai-gateway/ai-gateway-%i.env
+ExecStart=/usr/local/bin/AiGateway
+KillSignal=SIGTERM
+TimeoutStopSec=70s
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

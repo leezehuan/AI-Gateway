@@ -3,6 +3,7 @@
 #include "gateway/governance.hpp"
 #include "gateway/health.hpp"
 #include "gateway/http_server.hpp"
+#include "gateway/lifecycle.hpp"
 #include "gateway/metrics.hpp"
 #include "gateway/repository.hpp"
 #include "gateway/runtime.hpp"
@@ -23,17 +24,19 @@ int main()
         ai_gateway::RoutingRuntime routing(config, routing_store);
         ai_gateway::HiredisGovernanceStore governance_store(config);
         ai_gateway::GovernanceRuntime governance(config, governance_store);
+        ai_gateway::NodeLifecycle lifecycle(config);
         ai_gateway::MetricsRegistry metrics;
-        ai_gateway::CurlMultiProviderTransport transport;
+        ai_gateway::CurlMultiProviderTransport transport(config);
         ai_gateway::HealthProbeRuntime health_probes(
             runtime, routing, governance, transport, metrics);
-        ai_gateway::AiGateway gateway(runtime, routing, governance, metrics, transport);
+        ai_gateway::AiGateway gateway(
+            runtime, routing, governance, lifecycle, metrics, transport);
         ai_gateway::structured_log(
             "gateway_started",
             {{"listen_address", config.listen_address},
              {"listen_port", std::to_string(config.listen_port)},
              {"ready", gateway.ready() ? "true" : "false"}});
-        ai_gateway::HttpServer server(config, gateway);
+        ai_gateway::HttpServer server(config, gateway, lifecycle);
         server.run();
         transport.shutdown();
         return 0;

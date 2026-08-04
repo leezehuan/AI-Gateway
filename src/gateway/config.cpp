@@ -99,6 +99,18 @@ GatewayConfig GatewayConfig::from_env()
         2, std::min<std::size_t>(8, std::thread::hardware_concurrency()));
     config.io_threads = env_number<std::size_t>(
         "AI_GATEWAY_IO_THREADS", default_threads, 1, 64);
+    config.max_active_requests = env_number<std::size_t>(
+        "AI_GATEWAY_MAX_ACTIVE_REQUESTS", 256, 1, 100000);
+    config.max_active_streams = env_number<std::size_t>(
+        "AI_GATEWAY_MAX_ACTIVE_STREAMS", 128, 1, 100000);
+    config.curl_max_total_connections = env_number<std::size_t>(
+        "AI_GATEWAY_CURL_MAX_TOTAL_CONNECTIONS", 128, 1, 10000);
+    config.curl_max_host_connections = env_number<std::size_t>(
+        "AI_GATEWAY_CURL_MAX_HOST_CONNECTIONS", 64, 1, 10000);
+    config.drain_timeout_ms = env_number<long>(
+        "AI_GATEWAY_DRAIN_TIMEOUT_MS", 60000, 100, 3600000);
+    config.shutdown_cancel_grace_ms = env_number<long>(
+        "AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS", 5000, 100, 60000);
     config.redis_host = env_string("AI_GATEWAY_REDIS_HOST", "127.0.0.1");
     config.redis_port = env_number<std::uint16_t>(
         "AI_GATEWAY_REDIS_PORT", 6379, 1, std::numeric_limits<std::uint16_t>::max());
@@ -152,6 +164,16 @@ void GatewayConfig::validate() const
     {
         throw std::runtime_error(
             "AI_GATEWAY_GOVERNANCE_LEASE_RENEW_MS must be less than half the lease TTL");
+    }
+    if (max_active_streams > max_active_requests)
+    {
+        throw std::runtime_error(
+            "AI_GATEWAY_MAX_ACTIVE_STREAMS must not exceed active requests");
+    }
+    if (curl_max_host_connections > curl_max_total_connections)
+    {
+        throw std::runtime_error(
+            "AI_GATEWAY_CURL_MAX_HOST_CONNECTIONS must not exceed total connections");
     }
 }
 } // namespace ai_gateway

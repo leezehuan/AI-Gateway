@@ -49,6 +49,20 @@ class DeploymentAssetsTest(unittest.TestCase):
         cls.nginx_config = (
             cls.repo / "deploy" / "nginx" / "ai-gateway.conf.example"
         ).read_text(encoding="utf-8")
+        cls.systemd_service = (
+            cls.repo / "deploy" / "systemd" / "ai-gateway@.service.example"
+        ).read_text(encoding="utf-8")
+        cls.systemd_common_env = (
+            cls.repo / "deploy" / "systemd" / "ai-gateway.env.example"
+        ).read_text(encoding="utf-8")
+        cls.systemd_instance_envs = [
+            (cls.repo / "deploy" / "systemd" / f"ai-gateway-{port}.env.example")
+            .read_text(encoding="utf-8")
+            for port in (8080, 8082)
+        ]
+        cls.cluster_runbook = (
+            cls.repo / "docs" / "operations" / "phase6-cluster.md"
+        ).read_text(encoding="utf-8")
 
     def test_lingsuan_provider_uses_responses_endpoint_and_environment_secret(self):
         provider = self.config["providers"][0]
@@ -88,6 +102,39 @@ class DeploymentAssetsTest(unittest.TestCase):
     def test_public_nginx_proxy_does_not_expose_metrics(self):
         self.assertIn("location = /metrics", self.nginx_config)
         self.assertIn("return 404", self.nginx_config)
+
+    def test_nginx_uses_two_least_connection_upstreams_without_post_replay(self):
+        self.assertIn("least_conn;", self.nginx_config)
+        self.assertIn("zone ai_gateway 64k;", self.nginx_config)
+        self.assertIn("server 127.0.0.1:8080", self.nginx_config)
+        self.assertIn("server 127.0.0.1:8082", self.nginx_config)
+        self.assertIn("max_fails=2 fail_timeout=10s", self.nginx_config)
+        self.assertIn("proxy_next_upstream error timeout;", self.nginx_config)
+        self.assertNotIn("non_idempotent", self.nginx_config)
+
+    def test_systemd_template_supports_two_gracefully_stopped_instances(self):
+        self.assertIn("EnvironmentFile=/etc/ai-gateway/ai-gateway.env", self.systemd_service)
+        self.assertIn("EnvironmentFile=/etc/ai-gateway/ai-gateway-%i.env", self.systemd_service)
+        self.assertIn("TimeoutStopSec=70s", self.systemd_service)
+        self.assertIn("Restart=on-failure", self.systemd_service)
+        self.assertIn("LimitNOFILE=65536", self.systemd_service)
+        self.assertIn("AI_GATEWAY_DRAIN_TIMEOUT_MS=60000", self.systemd_common_env)
+        self.assertIn("AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=5000", self.systemd_common_env)
+        self.assertIn("AI_GATEWAY_LISTEN_PORT=8080", self.systemd_instance_envs[0])
+        self.assertIn("AI_GATEWAY_LISTEN_PORT=8082", self.systemd_instance_envs[1])
+
+    def test_cluster_runbook_preserves_existing_streams_during_rolling_restart(self):
+        for required in (
+            "mark the target Gateway server `down`",
+            "nginx -t",
+            "reload Nginx",
+            "SIGTERM",
+            "GET /readyz` returns `200",
+            "SIGKILL",
+            "Redis",
+            "MySQL",
+        ):
+            self.assertIn(required, self.cluster_runbook)
 
 
 if __name__ == "__main__":

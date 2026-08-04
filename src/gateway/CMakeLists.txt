@@ -39,6 +39,7 @@ add_library(ai_gateway_runtime STATIC
     governance.cpp
     metrics.cpp
     health.cpp
+    lifecycle.cpp
 )
 target_include_directories(ai_gateway_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include

@@ -19,7 +19,7 @@ class CurlMultiProviderTransport final : public ProviderTransport
 public:
     struct Task;
 
-    CurlMultiProviderTransport();
+    explicit CurlMultiProviderTransport(const GatewayConfig &config);
     ~CurlMultiProviderTransport() override;
 
     CurlMultiProviderTransport(const CurlMultiProviderTransport &) = delete;

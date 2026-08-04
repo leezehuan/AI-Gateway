@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -152,6 +153,23 @@ public:
         writable_callback_ = std::move(callback);
     }
 
+    void set_completion_callback(std::function<void()> callback) override
+    {
+        bool call_now = false;
+        {
+            std::lock_guard<std::mutex> lock(response_mutex_);
+            call_now = completion_called_;
+            if (!call_now)
+            {
+                completion_callback_ = std::move(callback);
+            }
+        }
+        if (call_now && callback)
+        {
+            callback();
+        }
+    }
+
 private:
     void read_request()
     {
@@ -197,6 +215,11 @@ private:
 
         request_version_ = parser_->get().version();
         request_keep_alive_ = parser_->get().keep_alive();
+        {
+            std::lock_guard<std::mutex> lock(response_mutex_);
+            completion_callback_ = {};
+            completion_called_ = false;
+        }
         cancellation_source_ = CancellationSource();
         in_flight_hold_ = shared_from_this();
         monitor_disconnect();
@@ -411,6 +434,7 @@ private:
     {
         beast::error_code ignored;
         socket_.cancel(ignored);
+        notify_completion();
         {
             std::lock_guard<std::mutex> lock(response_mutex_);
             response_started_ = false;
@@ -439,9 +463,28 @@ private:
             return;
         }
         cancellation_source_.cancel();
+        notify_completion();
         beast::error_code ignored;
         socket_.shutdown(tcp::socket::shutdown_both, ignored);
         socket_.close(ignored);
+    }
+
+    void notify_completion()
+    {
+        std::function<void()> callback;
+        {
+            std::lock_guard<std::mutex> lock(response_mutex_);
+            if (completion_called_)
+            {
+                return;
+            }
+            completion_called_ = true;
+            callback = std::move(completion_callback_);
+        }
+        if (callback)
+        {
+            callback();
+        }
     }
 
     static http::status valid_status(int status)
@@ -484,6 +527,7 @@ private:
     std::string response_body_;
     std::deque<std::shared_ptr<std::string>> stream_queue_;
     std::function<void()> writable_callback_;
+    std::function<void()> completion_callback_;
     std::string request_id_;
     std::size_t queued_bytes_ = 0;
     int response_status_ = 500;
@@ -497,15 +541,21 @@ private:
     bool stream_write_in_progress_ = false;
     bool stream_last_sent_ = false;
     bool backpressured_ = false;
+    bool completion_called_ = false;
 };
 } // namespace
 
-HttpServer::HttpServer(const GatewayConfig &config, AiGateway &gateway)
+HttpServer::HttpServer(const GatewayConfig &config,
+                       AiGateway &gateway,
+                       NodeLifecycle &lifecycle)
     : config_(config),
       gateway_(gateway),
+      lifecycle_(lifecycle),
       io_(),
       acceptor_(io_),
-      signals_(io_, SIGINT, SIGTERM)
+      signals_(io_, SIGINT, SIGTERM),
+      drain_timer_(io_),
+      cancel_timer_(io_)
 {
     const auto address = asio::ip::make_address(config_.listen_address);
     tcp::endpoint endpoint(address, config_.listen_port);
@@ -531,11 +581,15 @@ HttpServer::HttpServer(const GatewayConfig &config, AiGateway &gateway)
 void HttpServer::run()
 {
     accept();
-    signals_.async_wait([this](const beast::error_code &, int) {
-        beast::error_code ignored;
-        acceptor_.close(ignored);
-        io_.stop();
+    lifecycle_.on_idle([this] {
+        asio::post(io_, [this] {
+            if (draining_)
+            {
+                stop(false);
+            }
+        });
     });
+    wait_for_signal();
 
     const std::size_t thread_count = std::max<std::size_t>(1, config_.io_threads);
     for (std::size_t index = 1; index < thread_count; ++index)
@@ -547,6 +601,94 @@ void HttpServer::run()
     {
         worker.join();
     }
+}
+
+void HttpServer::wait_for_signal()
+{
+    signals_.async_wait([this](const beast::error_code &error, int) {
+        if (error)
+        {
+            return;
+        }
+        if (draining_)
+        {
+            stop(true);
+            return;
+        }
+        begin_drain();
+        wait_for_signal();
+    });
+}
+
+void HttpServer::begin_drain()
+{
+    draining_ = true;
+    drain_started_ = std::chrono::steady_clock::now();
+    lifecycle_.begin_drain();
+    const NodeSnapshot state = lifecycle_.snapshot();
+    structured_log("gateway_draining",
+                   {{"active_requests", std::to_string(state.active_requests)},
+                    {"active_streams", std::to_string(state.active_streams)},
+                    {"drain_timeout_ms", std::to_string(config_.drain_timeout_ms)}});
+    drain_timer_.expires_after(std::chrono::milliseconds(config_.drain_timeout_ms));
+    drain_timer_.async_wait([this](const beast::error_code &error) {
+        if (!error && !stopping_)
+        {
+            cancel_remaining();
+        }
+    });
+}
+
+void HttpServer::cancel_remaining()
+{
+    if (cancelling_)
+    {
+        return;
+    }
+    cancelling_ = true;
+    lifecycle_.cancel_remaining();
+    const NodeSnapshot state = lifecycle_.snapshot();
+    structured_log("gateway_shutdown_cancelling",
+                   {{"active_requests", std::to_string(state.active_requests)},
+                    {"active_streams", std::to_string(state.active_streams)},
+                    {"cancelled_requests", std::to_string(state.shutdown_cancellations)}});
+    cancel_timer_.expires_after(
+        std::chrono::milliseconds(config_.shutdown_cancel_grace_ms));
+    cancel_timer_.async_wait([this](const beast::error_code &error) {
+        if (!error && !stopping_)
+        {
+            stop(true);
+        }
+    });
+}
+
+void HttpServer::stop(bool forced)
+{
+    if (stopping_)
+    {
+        return;
+    }
+    stopping_ = true;
+    beast::error_code ignored;
+    drain_timer_.cancel();
+    cancel_timer_.cancel();
+    signals_.cancel(ignored);
+    acceptor_.close(ignored);
+    const NodeSnapshot state = lifecycle_.snapshot();
+    const auto duration = draining_
+                              ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - drain_started_).count()
+                              : 0;
+    structured_log("gateway_stopped",
+                   {{"active_requests", std::to_string(state.active_requests)},
+                    {"active_streams", std::to_string(state.active_streams)},
+                    {"duration_ms", std::to_string(duration)},
+                    {"forced", forced ? "true" : "false"}});
+    if (forced)
+    {
+        std::_Exit(EXIT_SUCCESS);
+    }
+    io_.stop();
 }
 
 void HttpServer::accept()

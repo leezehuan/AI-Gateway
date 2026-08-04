@@ -1,5 +1,6 @@
 #include "gateway/gateway.hpp"
 #include "gateway/governance.hpp"
+#include "gateway/lifecycle.hpp"
 #include "gateway/metrics.hpp"
 #include "gateway/runtime.hpp"
 #include "gateway/routing.hpp"
@@ -203,7 +204,8 @@ void finish_without_attempt(RuntimeState &runtime,
                             bool stream,
                             std::string tenant_slug,
                             std::string public_api_key_id,
-                            std::size_t max_attempts)
+                            std::size_t max_attempts,
+                            std::shared_ptr<NodeExecutionGuard> node_guard)
 {
     RequestFinish finish;
     finish.request_id = request.request_id;
@@ -221,7 +223,8 @@ void finish_without_attempt(RuntimeState &runtime,
          started, logical_model = std::move(logical_model),
          provider_result = std::move(provider_result), response_bytes, stream,
          tenant_slug = std::move(tenant_slug),
-         public_api_key_id = std::move(public_api_key_id)](bool stored) mutable {
+         public_api_key_id = std::move(public_api_key_id),
+         node_guard = std::move(node_guard)](bool stored) mutable {
             governance.release(
                 std::move(permit),
                 [request = std::move(request), status, started,
@@ -229,7 +232,8 @@ void finish_without_attempt(RuntimeState &runtime,
                  provider_result = stored ? std::move(provider_result)
                                           : std::string("usage_unavailable"),
                  response_bytes, stream, tenant_slug = std::move(tenant_slug),
-                 public_api_key_id = std::move(public_api_key_id)](bool) mutable {
+                 public_api_key_id = std::move(public_api_key_id),
+                 node_guard = std::move(node_guard)](bool) mutable {
                     log_completion(request, status, started, logical_model, provider_result,
                                    response_bytes, stream, 0, tenant_slug,
                                    public_api_key_id);
@@ -459,11 +463,13 @@ private:
     std::string buffer_;
 };
 
-std::string stream_terminal_error(long sequence_number, const std::string &code)
+std::string stream_terminal_error(long sequence_number,
+                                  const std::string &code,
+                                  const std::string &message = "Upstream provider stream failed")
 {
     json payload = {{"type", "error"},
                     {"code", code},
-                    {"message", "Upstream provider stream failed"},
+                    {"message", message},
                     {"param", nullptr},
                     {"sequence_number", std::max<long>(0, sequence_number)}};
     return "event: error\ndata: " + payload.dump() + "\n\n";
@@ -750,6 +756,8 @@ public:
                      std::size_t max_attempts,
                      std::shared_ptr<const GovernancePermit> governance_permit,
                      std::shared_ptr<LeaseLossSignal> lease_loss,
+                     std::shared_ptr<NodeRequestLease> node_lease,
+                     std::shared_ptr<NodeExecutionGuard> node_guard,
                      bool stream,
                      std::chrono::steady_clock::time_point started)
         : runtime_(runtime),
@@ -773,6 +781,8 @@ public:
           max_attempts_(max_attempts),
           governance_permit_(std::move(governance_permit)),
           lease_loss_(std::move(lease_loss)),
+          node_lease_(std::move(node_lease)),
+          node_guard_(std::move(node_guard)),
           stream_(stream),
           started_(started)
     {
@@ -781,6 +791,12 @@ public:
     void start()
     {
         const auto weak = weak_from_this();
+        node_lease_->on_shutdown([weak] {
+            if (auto self = weak.lock())
+            {
+                self->shutdown();
+            }
+        });
         lease_loss_->subscribe([weak] {
             if (auto self = weak.lock())
             {
@@ -806,6 +822,22 @@ public:
     }
 
 private:
+    void shutdown()
+    {
+        if (shutdown_requested_.exchange(true))
+        {
+            return;
+        }
+        if (binding_)
+        {
+            binding_->cancel();
+        }
+        else
+        {
+            finalize_shutdown();
+        }
+    }
+
     void on_governance_lost()
     {
         governance_lost_.store(true);
@@ -1503,6 +1535,11 @@ private:
                 ++exact_cost_attempt_count_;
             }
         }
+        if (shutdown_requested_.load())
+        {
+            finalize_shutdown();
+            return;
+        }
         if (decision.state == "cancelled")
         {
             finalize_cancelled();
@@ -1664,7 +1701,37 @@ private:
         finalize_log(499, "client_cancelled");
     }
 
-    void finalize_log(int status, const std::string &provider_result, std::size_t bytes = 0)
+    void finalize_shutdown()
+    {
+        if (finalized_)
+        {
+            return;
+        }
+        if (committed_)
+        {
+            if (!terminal_error_written_)
+            {
+                const std::string event = stream_terminal_error(
+                    std::max<long>(stream_last_sequence_number_ + 1, 1),
+                    "gateway_shutdown", "Gateway node is shutting down");
+                downstream_response_bytes_ += event.size();
+                response_.write(event);
+                terminal_error_written_ = true;
+            }
+            response_.end();
+            finalize_log(200, "gateway_shutdown", 0, "cancelled");
+            return;
+        }
+        const std::string body = openai_error_body(
+            "Gateway node is shutting down", "server_error", "gateway_shutdown");
+        write_response(response_, 503, request_.request_id, body, {{"retry-after", "1"}});
+        finalize_log(503, "gateway_shutdown", body.size(), "cancelled");
+    }
+
+    void finalize_log(int status,
+                      const std::string &provider_result,
+                      std::size_t bytes = 0,
+                      std::string terminal_state = {})
     {
         if (finalized_)
         {
@@ -1680,7 +1747,10 @@ private:
         const std::size_t response_bytes = stream_ ? downstream_response_bytes_ : bytes;
         RequestFinish finish;
         finish.request_id = request_.request_id;
-        finish.state = status == 200 ? "succeeded" : (status == 499 ? "cancelled" : "failed");
+        finish.state = terminal_state.empty()
+                           ? (status == 200 ? "succeeded"
+                                            : (status == 499 ? "cancelled" : "failed"))
+                           : std::move(terminal_state);
         finish.final_mapping_id = provider_attempt_count_ == 0 ? 0 : current_target_.mapping_id;
         finish.final_provider_id = provider_attempt_count_ == 0 ? 0 : current_target_.provider_id;
         finish.final_endpoint_id = provider_attempt_count_ == 0 ? 0 : current_target_.endpoint_id;
@@ -1828,6 +1898,8 @@ private:
     std::shared_ptr<const GovernancePermit> governance_permit_;
     std::shared_ptr<const GovernancePermit> credential_permit_;
     std::shared_ptr<LeaseLossSignal> lease_loss_;
+    std::shared_ptr<NodeRequestLease> node_lease_;
+    std::shared_ptr<NodeExecutionGuard> node_guard_;
     bool stream_ = false;
     std::chrono::steady_clock::time_point started_;
     std::chrono::steady_clock::time_point attempt_started_;
@@ -1868,6 +1940,7 @@ private:
     std::atomic_bool paused_{false};
     std::atomic_bool client_cancelled_{false};
     std::atomic_bool governance_lost_{false};
+    std::atomic_bool shutdown_requested_{false};
 };
 } // namespace
 
@@ -1915,16 +1988,18 @@ void CancellationSource::cancel() const
 AiGateway::AiGateway(RuntimeState &runtime,
                      RoutingRuntime &routing,
                      GovernanceRuntime &governance,
+                     NodeLifecycle &lifecycle,
                      MetricsRegistry &metrics,
                      ProviderTransport &transport)
-    : runtime_(runtime), routing_(routing), governance_(governance), metrics_(metrics),
-      transport_(transport)
+    : runtime_(runtime), routing_(routing), governance_(governance), lifecycle_(lifecycle),
+      metrics_(metrics), transport_(transport)
 {
 }
 
 bool AiGateway::ready() const
 {
-    return runtime_.ready() && routing_.ready() && governance_.ready() && transport_.healthy();
+    return lifecycle_.ready() && runtime_.ready() && routing_.ready() && governance_.ready() &&
+           transport_.healthy();
 }
 
 void AiGateway::handle(const GatewayRequest &request,
@@ -1953,6 +2028,7 @@ void AiGateway::handle(const GatewayRequest &request,
     {
         metrics_.set_dependency_readiness(runtime_.ready(),
                                           routing_.ready() && governance_.ready());
+        metrics_.set_node_state(lifecycle_.snapshot());
         const std::string body = metrics_.render();
         response.begin(200, {{"content-type", "text/plain; version=0.0.4; charset=utf-8"},
                              {"cache-control", "no-store"},
@@ -2145,6 +2221,22 @@ void AiGateway::handle_authorized(GatewayRequest request,
     }
 
     const bool stream = payload.value("stream", false);
+    NodeAdmission node_admission = lifecycle_.admit(stream);
+    if (node_admission.status != NodeAdmissionStatus::admitted || !node_admission.lease)
+    {
+        const bool draining = node_admission.status == NodeAdmissionStatus::draining;
+        const std::string code = draining ? "gateway_draining" : "gateway_overloaded";
+        const std::string body = openai_error_body(
+            draining ? "Gateway node is draining" : "Gateway node is at capacity",
+            "server_error", code);
+        write_response(response, 503, request.request_id, body, {{"retry-after", "1"}});
+        log_completion(request, 503, started, logical_model, code, body.size(), stream, 0,
+                       tenant_slug, api_key_id);
+        return;
+    }
+    auto node_lease = std::move(node_admission.lease);
+    auto node_guard = node_lease->execution_guard();
+    response.set_completion_callback([node_lease] { node_lease->response_finished(); });
     std::string client_family = "generic";
     const auto user_agent = request.headers.find("user-agent");
     const auto originator = request.headers.find("originator");
@@ -2222,7 +2314,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
          tenant_database_id, api_key_database_id, model_database_id,
          payload = std::move(payload), route_request = std::move(route_request),
          request_admission = std::move(request_admission), max_attempts,
-         lease_loss](GovernanceResult admission) mutable {
+         lease_loss, node_lease, node_guard](GovernanceResult admission) mutable {
             if (cancellation.is_cancelled() || !response.client_connected())
             {
                 governance_.release(admission.permit);
@@ -2271,7 +2363,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                  tenant_database_id, api_key_database_id, model_database_id,
                  payload = std::move(payload), permit = std::move(admission.permit),
                  route_request = std::move(route_request), lease_loss,
-                 max_attempts](RequestAdmissionStatus request_status) mutable {
+                 max_attempts, node_lease, node_guard](RequestAdmissionStatus request_status) mutable {
                     if (request_status != RequestAdmissionStatus::admitted)
                     {
                         const bool budget = request_status ==
@@ -2282,7 +2374,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                             std::move(permit),
                             [request = std::move(request), &response, started,
                              logical_model, tenant_slug, api_key_id, stream,
-                             budget](bool rolled_back) mutable {
+                             budget, node_guard](bool rolled_back) mutable {
                                 const bool budget_error = budget && rolled_back;
                                 const int status = budget_error ? 429 : 503;
                                 const std::string code = budget_error
@@ -2305,7 +2397,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                         finish_without_attempt(runtime_, governance_, std::move(permit),
                                                std::move(request), 499, started, logical_model,
                                                "client_cancelled", 0, stream, tenant_slug,
-                                               api_key_id, max_attempts);
+                                               api_key_id, max_attempts, node_guard);
                         return;
                     }
                     routing_.plan(
@@ -2314,14 +2406,15 @@ void AiGateway::handle_authorized(GatewayRequest request,
                          logical_model, tenant_slug, api_key_id, started, stream,
                          tenant_database_id, api_key_database_id, model_database_id,
                          payload = std::move(payload), permit = std::move(permit),
-                         lease_loss, max_attempts](RoutePlan plan) mutable {
+                         lease_loss, max_attempts, node_lease,
+                         node_guard](RoutePlan plan) mutable {
                             if (cancellation.is_cancelled() || !response.client_connected())
                             {
                                 response.end();
                                 finish_without_attempt(
                                     runtime_, governance_, std::move(permit), std::move(request),
                                     499, started, logical_model, "client_cancelled", 0, stream,
-                                    tenant_slug, api_key_id, max_attempts);
+                                    tenant_slug, api_key_id, max_attempts, node_guard);
                                 return;
                             }
                             if (plan.status == RouteStatus::unavailable)
@@ -2333,7 +2426,8 @@ void AiGateway::handle_authorized(GatewayRequest request,
                                 finish_without_attempt(
                                     runtime_, governance_, std::move(permit), std::move(request),
                                     503, started, logical_model, "routing_unavailable",
-                                    body.size(), stream, tenant_slug, api_key_id, max_attempts);
+                                    body.size(), stream, tenant_slug, api_key_id, max_attempts,
+                                    node_guard);
                                 return;
                             }
                             if (plan.status != RouteStatus::ready || plan.candidates.empty())
@@ -2345,7 +2439,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                                 finish_without_attempt(
                                     runtime_, governance_, std::move(permit), std::move(request),
                                     503, started, logical_model, "no_candidate", body.size(),
-                                    stream, tenant_slug, api_key_id, max_attempts);
+                                    stream, tenant_slug, api_key_id, max_attempts, node_guard);
                                 return;
                             }
 
@@ -2356,7 +2450,8 @@ void AiGateway::handle_authorized(GatewayRequest request,
                                 std::move(plan.candidates), std::move(plan.affinity_key),
                                 logical_model, tenant_slug, api_key_id, tenant_database_id,
                                 api_key_database_id, model_database_id, max_attempts,
-                                std::move(permit), lease_loss, stream, started);
+                                std::move(permit), lease_loss, node_lease, node_guard,
+                                stream, started);
                             execution->start();
                         });
                 });

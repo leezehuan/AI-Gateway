@@ -107,3 +107,18 @@ _Avoid_: Attempt audit, Prompt log
 An explicitly configured, non-Usage Provider GET or HEAD operation protected by a cross-node probe
 lease and Credential quota whose result updates shared Candidate health.
 _Avoid_: `/healthz`, billable model request
+
+**Gateway Node**:
+One `AiGateway` process with local ingress, upstream connection, and lifecycle state. Nodes share
+identity, routing, and governance state but do not share local capacity counters.
+_Avoid_: Tenant, Provider, cluster
+
+**Node Capacity**:
+The local maximum of admitted proxy requests and streams, held until both durable finalization and
+actual downstream response completion. It is independent of distributed Concurrency Leases.
+_Avoid_: Quota Policy, readiness, libcurl queue
+
+**Drain**:
+The node state entered after a termination signal in which new valid proxy requests are rejected
+while already admitted work is allowed a bounded natural-completion window.
+_Avoid_: dependency outage, capacity saturation, process crash

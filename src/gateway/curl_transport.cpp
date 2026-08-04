@@ -342,14 +342,18 @@ void complete_task(CURLM *multi,
 }
 } // namespace
 
-CurlMultiProviderTransport::CurlMultiProviderTransport()
+CurlMultiProviderTransport::CurlMultiProviderTransport(const GatewayConfig &config)
 {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     multi_ = curl_multi_init();
     if (multi_ != nullptr)
     {
-        curl_multi_setopt(multi_, CURLMOPT_MAX_TOTAL_CONNECTIONS, 128L);
-        curl_multi_setopt(multi_, CURLMOPT_MAX_HOST_CONNECTIONS, 64L);
+        curl_multi_setopt(multi_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                          static_cast<long>(config.curl_max_total_connections));
+        curl_multi_setopt(multi_, CURLMOPT_MAX_HOST_CONNECTIONS,
+                          static_cast<long>(config.curl_max_host_connections));
+        curl_multi_setopt(multi_, CURLMOPT_MAXCONNECTS,
+                          static_cast<long>(config.curl_max_total_connections));
         healthy_.store(true);
         worker_ = std::thread(&CurlMultiProviderTransport::run, this);
     }
@@ -486,7 +490,7 @@ void CurlMultiProviderTransport::run()
             curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L);
             curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
             curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS,
-                             std::min<long>(5000, task->request.timeout_ms));
+                             task->request.timeout_ms);
             curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS,
                              task->request.streaming ? task->request.max_duration_ms
                                                      : task->request.timeout_ms);

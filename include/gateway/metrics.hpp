@@ -2,6 +2,7 @@
 #define AI_GATEWAY_METRICS_HPP
 
 #include "gateway/repository.hpp"
+#include "gateway/lifecycle.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -45,6 +46,7 @@ public:
     void stream_started();
     void stream_finished();
     void set_dependency_readiness(bool mysql_ready, bool redis_ready);
+    void set_node_state(const NodeSnapshot &snapshot);
     std::string render() const;
 
 private:

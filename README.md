@@ -1,10 +1,10 @@
 # Cluster-Chat-Server
 
-> Migration status: Phase 0 through Phase 5 add an independent C++ AI API gateway while the legacy
+> Migration status: Phase 0 through Phase 6 add an independent C++ AI API gateway while the legacy
 > chat server remains available as a rollback target. See
 > [`ai-api-gateway-migration-spec.md`](ai-api-gateway-migration-spec.md).
 
-## AI Gateway (Phase 5)
+## AI Gateway (Phase 6)
 
 `AiGateway` exposes `GET /healthz`, `GET /readyz`, internal `GET /metrics`, authenticated
 `GET /v1/models`, and streaming or non-streaming `POST /v1/responses`. It uses asynchronous
@@ -20,6 +20,12 @@ SQL is isolated on a fixed worker pool. Redis shares rolling RPM, renewable conc
 session affinity, Candidate health, circuit state, and probe leases across Gateway nodes. New proxy
 requests fail closed when either governance store is unavailable; `/healthz` remains available,
 and `/v1/models` does not consume quota or depend on Redis.
+
+Each Gateway node also enforces local request, stream, and libcurl connection capacity. A first
+`SIGTERM`/`SIGINT` makes `/readyz` fail and rejects new valid proxy requests while admitted work
+drains. After the drain deadline, remaining upstream requests are cancelled and given a bounded
+finalization window; a second signal forces shutdown. `/healthz`, `/metrics`, and authenticated
+`/v1/models` remain available during drain. Capacity saturation does not change readiness.
 
 Each Candidate is attempted at most once. Retryable pre-commit failures may move to another
 Candidate, up to the Route Policy limit; an SSE failure after the first business event never fails
@@ -139,6 +145,28 @@ The low watermark must be below the high watermark, and prefetch must not exceed
 watermark. The Nginx HTTP/1.1 reverse-proxy example for SSE is
 [`deploy/nginx/ai-gateway.conf.example`](deploy/nginx/ai-gateway.conf.example).
 
+The node lifecycle controls use these defaults:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `AI_GATEWAY_MAX_ACTIVE_REQUESTS` | `256` | Admitted proxy requests held through response flush and finalization |
+| `AI_GATEWAY_MAX_ACTIVE_STREAMS` | `128` | Admitted streaming subset of active requests |
+| `AI_GATEWAY_CURL_MAX_TOTAL_CONNECTIONS` | `128` | Process-wide upstream and connection-cache limit |
+| `AI_GATEWAY_CURL_MAX_HOST_CONNECTIONS` | `64` | Upstream connections allowed to one Provider host |
+| `AI_GATEWAY_DRAIN_TIMEOUT_MS` | `60000` | Natural completion window after the first termination signal |
+| `AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS` | `5000` | Finalization window after active upstream cancellation |
+
+The stream limit must not exceed the request limit, and the per-host curl limit must not exceed
+the total limit. Capacity rejection returns `503 gateway_overloaded`; drain rejection returns
+`503 gateway_draining`. Neither consumes distributed quota nor creates Usage or Attempt rows.
+
+The Nginx example uses two local Gateway upstreams (`8080` and `8082`), `least_conn`, a shared
+upstream zone, Keep-Alive, and conservative passive failure handling without replaying a sent POST.
+The systemd template and instance environments are under
+[`deploy/systemd`](deploy/systemd/ai-gateway@.service.example). Installation, rolling restart,
+hard-failure, and shared-dependency procedures are in
+[`docs/operations/phase6-cluster.md`](docs/operations/phase6-cluster.md).
+
 Run the localhost integration tests, which start temporary MariaDB and Redis instances, two Mock
 Providers, and two Gateway nodes, with:
 
@@ -146,7 +174,7 @@ Providers, and two Gateway nodes, with:
 ctest --test-dir build/gateway --output-on-failure
 ```
 
-When Nginx is installed, the suite also checks the non-root example configuration and incremental
+When Nginx is installed, the suite also checks the non-root cluster configuration and incremental
 SSE delivery through Nginx. The captured Codex client requests `stream=true`; its request and event
 contract is covered by the localhost Provider fixture. Architectural decisions and the captured
 contract are in `docs/adr/` and `docs/compatibility/`.

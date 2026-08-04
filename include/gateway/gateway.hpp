@@ -17,6 +17,8 @@
 
 namespace ai_gateway
 {
+class NodeLifecycle;
+class NodeExecutionGuard;
 class RuntimeState;
 class RoutingRuntime;
 class GovernanceRuntime;
@@ -71,6 +73,7 @@ public:
     virtual void end() = 0;
     virtual bool client_connected() const = 0;
     virtual void set_writable_callback(std::function<void()> callback) = 0;
+    virtual void set_completion_callback(std::function<void()> callback) = 0;
 };
 
 struct GatewayConfig
@@ -95,6 +98,12 @@ struct GatewayConfig
     long stream_idle_timeout_ms = 60000;
     long stream_max_duration_ms = 900000;
     std::size_t io_threads = 2;
+    std::size_t max_active_requests = 256;
+    std::size_t max_active_streams = 128;
+    std::size_t curl_max_total_connections = 128;
+    std::size_t curl_max_host_connections = 64;
+    long drain_timeout_ms = 60000;
+    long shutdown_cancel_grace_ms = 5000;
     std::string redis_host = "127.0.0.1";
     std::uint16_t redis_port = 6379;
     std::string redis_username;
@@ -203,6 +212,7 @@ public:
     AiGateway(RuntimeState &runtime,
               RoutingRuntime &routing,
               GovernanceRuntime &governance,
+              NodeLifecycle &lifecycle,
               MetricsRegistry &metrics,
               ProviderTransport &transport);
 
@@ -221,6 +231,7 @@ private:
     RuntimeState &runtime_;
     RoutingRuntime &routing_;
     GovernanceRuntime &governance_;
+    NodeLifecycle &lifecycle_;
     MetricsRegistry &metrics_;
     ProviderTransport &transport_;
 };

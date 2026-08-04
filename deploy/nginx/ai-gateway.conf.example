@@ -1,5 +1,8 @@
 upstream ai_gateway {
-    server 127.0.0.1:8080;
+    zone ai_gateway 64k;
+    least_conn;
+    server 127.0.0.1:8080 max_fails=2 fail_timeout=10s;
+    server 127.0.0.1:8082 max_fails=2 fail_timeout=10s;
     keepalive 64;
 }
 
@@ -25,5 +28,9 @@ server {
         proxy_request_buffering off;
         proxy_read_timeout 910s;
         proxy_send_timeout 60s;
+
+        # Retrying a Responses POST after it was sent can duplicate Provider cost.
+        proxy_next_upstream error timeout;
+        proxy_next_upstream_tries 2;
     }
 }

@@ -302,6 +302,25 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             self.close_connection = True
+        elif scenario == "stream_cluster_drain":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(
+                    b'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(1.5)
+                self.wfile.write(
+                    b'event: response.completed\ndata: {"type":"response.completed","sequence_number":1}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
         elif scenario == "stream_concurrent_slow":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -923,6 +942,365 @@ class GatewayIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["id"], "gateway-model")
+
+    def start_phase6_gateway(self, **overrides):
+        port = free_port()
+        environment = self.gateway_environment(port)
+        environment.update({key: str(value) for key, value in overrides.items()})
+        process = subprocess.Popen(
+            [self.gateway_binary], env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        logs = []
+        log_thread = threading.Thread(
+            target=lambda: logs.extend(iter(process.stdout.readline, "")), daemon=True
+        )
+        log_thread.start()
+        self.wait_for_gateway_port(port)
+        return port, process, logs, log_thread
+
+    def stop_phase6_gateway(self, process, log_thread):
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        process.stdout.close()
+        log_thread.join(timeout=1)
+
+    def test_phase6_node_stream_capacity_rejects_without_provider_call_and_recovers(self):
+        self.provider_state.reset("stream_disconnect_after_first")
+        port, process, _, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_MAX_ACTIVE_REQUESTS=2,
+            AI_GATEWAY_MAX_ACTIVE_STREAMS=1,
+        )
+        connection = None
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            payload = json.dumps(
+                {"model": "gateway-model", "input": "hold capacity", "stream": True}
+            )
+            headers = {
+                "Authorization": f"Bearer {GATEWAY_KEY}",
+                "Content-Type": "application/json",
+            }
+            connection.request("POST", "/v1/responses", payload, headers)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            first = response.readline() + response.readline() + response.readline()
+            self.assertIn(b"event: response.created", first)
+            provider_calls = len(self.provider_state.snapshot()[1])
+
+            denied = self.request_at(port, "POST", "/v1/responses", payload, headers)
+            self.assertEqual(denied[0], 503)
+            self.assertEqual(json.loads(denied[2])["error"]["code"], "gateway_overloaded")
+            self.assertEqual(len(self.provider_state.snapshot()[1]), provider_calls)
+            self.assertEqual(self.request_at(port, "GET", "/readyz")[0], 200)
+            metrics = self.request_at(port, "GET", "/metrics")[2].decode()
+            self.assertIn("ai_gateway_active_requests 1", metrics)
+            self.assertIn("ai_gateway_active_streams 1", metrics)
+            self.assertIn(
+                'ai_gateway_capacity_rejections_total{resource="streams"} 1', metrics
+            )
+
+            connection.close()
+            connection = None
+            self.assertTrue(self.provider_state.provider_disconnected.wait(1.5))
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                metrics = self.request_at(port, "GET", "/metrics")[2].decode()
+                if "ai_gateway_active_requests 0" in metrics:
+                    break
+                time.sleep(0.02)
+            self.assertIn("ai_gateway_active_requests 0", metrics)
+
+            self.provider_state.reset()
+            recovered = self.request_at(
+                port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "capacity recovered"}),
+                headers,
+            )
+            self.assertEqual(recovered[0], 200)
+        finally:
+            if connection is not None:
+                connection.close()
+            self.stop_phase6_gateway(process, log_thread)
+
+    def test_phase6_node_request_capacity_rejects_without_provider_call(self):
+        self.provider_state.reset("slow_success")
+        port, process, _, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_MAX_ACTIVE_REQUESTS=1,
+            AI_GATEWAY_MAX_ACTIVE_STREAMS=1,
+        )
+        result = []
+        headers = {"Authorization": f"Bearer {GATEWAY_KEY}"}
+        payload = json.dumps({"model": "gateway-model", "input": "hold request"})
+        active = threading.Thread(
+            target=lambda: result.append(
+                self.request_at(port, "POST", "/v1/responses", payload, headers)
+            )
+        )
+        try:
+            active.start()
+            deadline = time.time() + 2
+            while time.time() < deadline and not self.provider_state.snapshot()[1]:
+                time.sleep(0.01)
+            self.assertTrue(self.provider_state.snapshot()[1])
+            provider_calls = len(self.provider_state.snapshot()[1])
+            denied = self.request_at(port, "POST", "/v1/responses", payload, headers)
+            self.assertEqual(denied[0], 503)
+            self.assertEqual(json.loads(denied[2])["error"]["code"], "gateway_overloaded")
+            self.assertEqual(len(self.provider_state.snapshot()[1]), provider_calls)
+            metrics = self.request_at(port, "GET", "/metrics")[2].decode()
+            self.assertIn(
+                'ai_gateway_capacity_rejections_total{resource="requests"} 1', metrics
+            )
+            active.join(timeout=3)
+            self.assertFalse(active.is_alive())
+            self.assertEqual(result[0][0], 200)
+        finally:
+            active.join(timeout=1)
+            self.stop_phase6_gateway(process, log_thread)
+
+    def test_phase6_capacity_is_held_until_slow_client_finishes_response(self):
+        self.provider_state.reset("stream_backpressure")
+        port, process, logs, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_MAX_ACTIVE_REQUESTS=1,
+            AI_GATEWAY_MAX_ACTIVE_STREAMS=1,
+            AI_GATEWAY_MAX_RESPONSE_BYTES=20 * 1024 * 1024,
+            AI_GATEWAY_STREAM_BUFFER_HIGH_WATER_BYTES=20 * 1024 * 1024,
+            AI_GATEWAY_STREAM_BUFFER_LOW_WATER_BYTES=1024,
+            AI_GATEWAY_STREAM_MAX_DURATION_MS=15000,
+        )
+        connection = None
+        try:
+            payload = json.dumps(
+                {"model": "gateway-model", "input": "slow downstream", "stream": True}
+            )
+            headers = {
+                "Authorization": f"Bearer {GATEWAY_KEY}",
+                "Content-Type": "application/json",
+            }
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            connection.request("POST", "/v1/responses", payload, headers)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertTrue(self.provider_state.stream_finished.wait(5))
+
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                if any(
+                    '"event":"request_completed"' in line and '"stream":"true"' in line
+                    for line in logs
+                ):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(
+                any('"event":"request_completed"' in line for line in logs),
+                "request finalization did not complete while downstream was blocked",
+            )
+
+            metrics = self.request_at(port, "GET", "/metrics")[2].decode()
+            self.assertIn("ai_gateway_active_requests 1", metrics)
+            denied = self.request_at(port, "POST", "/v1/responses", payload, headers)
+            self.assertEqual(denied[0], 503)
+            self.assertEqual(json.loads(denied[2])["error"]["code"], "gateway_overloaded")
+
+            connection.close()
+            connection = None
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                metrics = self.request_at(port, "GET", "/metrics")[2].decode()
+                if "ai_gateway_active_requests 0" in metrics:
+                    break
+                time.sleep(0.02)
+            self.assertIn("ai_gateway_active_requests 0", metrics)
+        finally:
+            if connection is not None:
+                connection.close()
+            self.stop_phase6_gateway(process, log_thread)
+
+    def test_phase6_sigterm_drains_an_existing_stream_before_exit(self):
+        self.provider_state.reset("stream_cluster_drain")
+        port, process, logs, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_DRAIN_TIMEOUT_MS=3000,
+            AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=500,
+        )
+        result = []
+        client = threading.Thread(
+            target=lambda: result.append(
+                self.request_at(
+                    port, "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "drain", "stream": True}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=5,
+                )
+            )
+        )
+        try:
+            client.start()
+            deadline = time.time() + 2
+            while time.time() < deadline and not self.provider_state.snapshot()[1]:
+                time.sleep(0.01)
+            self.assertTrue(self.provider_state.snapshot()[1])
+            process.terminate()
+            deadline = time.time() + 1
+            ready_status = None
+            while time.time() < deadline and process.poll() is None:
+                try:
+                    ready_status = self.request_at(port, "GET", "/readyz", timeout=0.2)[0]
+                    if ready_status == 503:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            self.assertEqual(ready_status, 503)
+            self.assertEqual(self.request_at(port, "GET", "/healthz")[0], 200)
+            self.assertEqual(self.request_at(port, "GET", "/metrics")[0], 200)
+            self.assertEqual(
+                self.request_at(
+                    port, "GET", "/v1/models",
+                    headers={"Authorization": f"Bearer {GATEWAY_KEY}"},
+                )[0],
+                200,
+            )
+            provider_calls = len(self.provider_state.snapshot()[1])
+            denied = self.request_at(
+                port, "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "new during drain"}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}"},
+            )
+            self.assertEqual(denied[0], 503)
+            self.assertEqual(json.loads(denied[2])["error"]["code"], "gateway_draining")
+            self.assertEqual(
+                next(value for name, value in denied[1].items()
+                     if name.lower() == "retry-after"),
+                "1",
+            )
+            self.assertEqual(len(self.provider_state.snapshot()[1]), provider_calls)
+            client.join(timeout=5)
+            self.assertFalse(client.is_alive())
+            self.assertEqual(result[0][0], 200)
+            self.assertTrue(result[0][2].endswith(b"data: [DONE]\n\n"))
+            self.assertEqual(process.wait(timeout=3), 0)
+            records = [json.loads(line) for line in logs if line.startswith("{")]
+            self.assertTrue(any(item.get("event") == "gateway_draining" for item in records))
+            self.assertTrue(any(item.get("event") == "gateway_stopped" for item in records))
+        finally:
+            client.join(timeout=1)
+            self.stop_phase6_gateway(process, log_thread)
+
+    def test_phase6_drain_timeout_cancels_committed_stream_with_terminal_error(self):
+        self.provider_state.reset("stream_disconnect_after_first")
+        port, process, logs, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_DRAIN_TIMEOUT_MS=200,
+            AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=1000,
+        )
+        connection = None
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            connection.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "cancel drain", "stream": True}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            first = response.readline() + response.readline() + response.readline()
+            self.assertIn(b"event: response.created", first)
+            process.terminate()
+            remaining = response.read()
+            body = first + remaining
+            self.assertEqual(body.count(b"event: error\n"), 1)
+            self.assertIn(b'"code":"gateway_shutdown"', body)
+            self.assertNotIn(b"data: [DONE]", body)
+            self.assertTrue(self.provider_state.provider_disconnected.wait(1.5))
+            self.assertEqual(process.wait(timeout=3), 0)
+            records = [json.loads(line) for line in logs if line.startswith("{")]
+            self.assertTrue(
+                any(item.get("event") == "gateway_shutdown_cancelling" for item in records)
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+            self.stop_phase6_gateway(process, log_thread)
+
+    def test_phase6_drain_timeout_cancels_precommit_stream_without_failover(self):
+        self.provider_state.reset("stream_disconnect_before_first")
+        self.provider_secondary_state.reset()
+        port, process, _, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_DRAIN_TIMEOUT_MS=200,
+            AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=1000,
+        )
+        result = []
+        client = threading.Thread(
+            target=lambda: result.append(
+                self.request_at(
+                    port, "POST", "/v1/responses",
+                    json.dumps({"model": "gateway-model", "input": "precommit",
+                                "stream": True}),
+                    {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=5,
+                )
+            )
+        )
+        try:
+            client.start()
+            deadline = time.time() + 2
+            while time.time() < deadline and not self.provider_state.snapshot()[1]:
+                time.sleep(0.01)
+            self.assertTrue(self.provider_state.snapshot()[1])
+            process.terminate()
+            client.join(timeout=4)
+            self.assertFalse(client.is_alive())
+            self.assertEqual(result[0][0], 503)
+            self.assertEqual(json.loads(result[0][2])["error"]["code"], "gateway_shutdown")
+            self.assertEqual(self.provider_secondary_state.snapshot()[1], [])
+            self.assertTrue(self.provider_state.provider_disconnected.wait(1.5))
+            self.assertEqual(process.wait(timeout=3), 0)
+        finally:
+            client.join(timeout=1)
+            self.stop_phase6_gateway(process, log_thread)
+
+    def test_phase6_second_signal_forces_immediate_shutdown(self):
+        self.provider_state.reset("stream_disconnect_after_first")
+        port, process, logs, log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_DRAIN_TIMEOUT_MS=5000,
+            AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=1000,
+        )
+        connection = None
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.request(
+                "POST", "/v1/responses",
+                json.dumps({"model": "gateway-model", "input": "force", "stream": True}),
+                {"Authorization": f"Bearer {GATEWAY_KEY}",
+                 "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn(
+                b"event: response.created",
+                response.readline() + response.readline() + response.readline(),
+            )
+            process.terminate()
+            deadline = time.time() + 1
+            while time.time() < deadline:
+                try:
+                    if self.request_at(port, "GET", "/readyz", timeout=0.2)[0] == 503:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            forced_at = time.monotonic()
+            process.terminate()
+            self.assertEqual(process.wait(timeout=2), 0, "".join(logs[-40:]))
+            self.assertLess(time.monotonic() - forced_at, 1.5)
+            records = [json.loads(line) for line in logs if line.startswith("{")]
+            self.assertTrue(
+                any(item.get("event") == "gateway_stopped" and
+                    item.get("forced") == "true" for item in records)
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+            self.stop_phase6_gateway(process, log_thread)
 
     def test_phase5_rpm_is_shared_across_gateway_nodes(self):
         headers = {"Authorization": f"Bearer {RPM_KEY}", "Content-Type": "application/json"}
@@ -1882,6 +2260,35 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.assertNotIn(GATEWAY_KEY, process.stdout)
             self.assertNotIn(PROVIDER_KEY, process.stdout)
 
+    def test_phase6_invalid_node_and_connection_capacity_fails_at_startup(self):
+        base = self.gateway_environment(free_port())
+        for values, message in [
+            (
+                {
+                    "AI_GATEWAY_MAX_ACTIVE_REQUESTS": "64",
+                    "AI_GATEWAY_MAX_ACTIVE_STREAMS": "65",
+                },
+                "must not exceed active requests",
+            ),
+            (
+                {
+                    "AI_GATEWAY_CURL_MAX_TOTAL_CONNECTIONS": "32",
+                    "AI_GATEWAY_CURL_MAX_HOST_CONNECTIONS": "33",
+                },
+                "must not exceed total connections",
+            ),
+        ]:
+            environment = dict(base)
+            environment.update(values)
+            process = subprocess.run(
+                [self.gateway_binary], env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=3, check=False,
+            )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn(message, process.stdout)
+            self.assertNotIn(GATEWAY_KEY, process.stdout)
+            self.assertNotIn(PROVIDER_KEY, process.stdout)
+
     def test_authentication_and_protocol_errors(self):
         status, _, body = self.request("GET", "/v1/models")
         self.assertEqual(status, 401)
@@ -2057,8 +2464,11 @@ class GatewayIntegrationTest(unittest.TestCase):
         self.assertIn("proxy_buffering off;", site)
         self.assertIn("proxy_request_buffering off;", site)
         site = site.replace(
-            "server 127.0.0.1:8080;",
-            f"server 127.0.0.1:{self.gateway_port};",
+            "server 127.0.0.1:8080 max_fails=2 fail_timeout=10s;",
+            f"server 127.0.0.1:{self.gateway_port} max_fails=2 fail_timeout=10s;",
+        ).replace(
+            "server 127.0.0.1:8082 max_fails=2 fail_timeout=10s;",
+            f"server 127.0.0.1:{self.gateway_secondary_port} max_fails=2 fail_timeout=10s;",
         ).replace("listen 8081;", f"listen {nginx_port};")
         config_path = os.path.join(nginx_dir, "nginx.conf")
         with open(config_path, "w", encoding="utf-8") as output:
@@ -2138,6 +2548,220 @@ class GatewayIntegrationTest(unittest.TestCase):
                 nginx.kill()
                 nginx.wait(timeout=5)
 
+    @unittest.skipUnless(shutil.which("nginx"), "nginx is not installed")
+    def test_phase6_nginx_reload_moves_new_streams_while_target_node_drains(self):
+        self.provider_state.reset("stream_cluster_drain")
+        first_port, first, first_logs, first_log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_DRAIN_TIMEOUT_MS=3000,
+            AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=500,
+        )
+        second_port, second, _, second_log_thread = self.start_phase6_gateway(
+            AI_GATEWAY_DRAIN_TIMEOUT_MS=3000,
+            AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS=500,
+        )
+        nginx_port = free_port()
+        nginx_dir = os.path.join(self.database_temp.name, "nginx-phase6-cluster")
+        os.makedirs(nginx_dir, exist_ok=True)
+        with open(
+            os.path.join(self.repo, "deploy", "nginx", "ai-gateway.conf.example"),
+            encoding="utf-8",
+        ) as source:
+            base_site = source.read()
+        first_server = (
+            f"server 127.0.0.1:{first_port} max_fails=2 fail_timeout=10s;"
+        )
+        second_server = (
+            f"server 127.0.0.1:{second_port} max_fails=2 fail_timeout=10s;"
+        )
+        base_site = base_site.replace(
+            "server 127.0.0.1:8080 max_fails=2 fail_timeout=10s;", first_server,
+        ).replace(
+            "server 127.0.0.1:8082 max_fails=2 fail_timeout=10s;", second_server,
+        ).replace("listen 8081;", f"listen {nginx_port};")
+        config_path = os.path.join(nginx_dir, "nginx.conf")
+
+        def write_nginx(site):
+            with open(config_path, "w", encoding="utf-8") as output:
+                output.write(
+                    "worker_processes 1;\n"
+                    f"pid {nginx_dir}/nginx.pid;\n"
+                    f"error_log {nginx_dir}/error.log notice;\n"
+                    "events { worker_connections 64; }\n"
+                    "http { access_log off;\n"
+                    f"{site}\n"
+                    "}\n"
+                )
+
+        initial_site = base_site.replace(second_server, second_server[:-1] + " down;")
+        write_nginx(initial_site)
+        config_test = subprocess.run(
+            ["nginx", "-t", "-p", nginx_dir, "-c", config_path],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        self.assertEqual(config_test.returncode, 0, config_test.stdout)
+        nginx = subprocess.Popen(
+            ["nginx", "-p", nginx_dir, "-c", config_path, "-g", "daemon off;"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        first_connection = None
+        second_client = None
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    if self.request_at(nginx_port, "GET", "/healthz", timeout=0.3)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            else:
+                self.fail("cluster Nginx did not become ready")
+
+            payload = json.dumps(
+                {"model": "gateway-model", "input": "rolling drain", "stream": True}
+            )
+            headers = {
+                "Authorization": f"Bearer {GATEWAY_KEY}",
+                "Content-Type": "application/json",
+            }
+            first_connection = http.client.HTTPConnection("127.0.0.1", nginx_port, timeout=6)
+            first_connection.request("POST", "/v1/responses", payload, headers)
+            first_response = first_connection.getresponse()
+            self.assertEqual(first_response.status, 200)
+            first_event = (
+                first_response.readline() + first_response.readline() + first_response.readline()
+            )
+            self.assertIn(b"event: response.created", first_event)
+
+            reloaded_site = base_site.replace(first_server, first_server[:-1] + " down;")
+            write_nginx(reloaded_site)
+            config_test = subprocess.run(
+                ["nginx", "-t", "-p", nginx_dir, "-c", config_path],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertEqual(config_test.returncode, 0, config_test.stdout)
+            reload_result = subprocess.run(
+                ["nginx", "-s", "reload", "-p", nginx_dir, "-c", config_path],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertEqual(reload_result.returncode, 0, reload_result.stdout)
+            first.terminate()
+            time.sleep(0.15)
+
+            second_result = []
+            second_client = threading.Thread(
+                target=lambda: second_result.append(
+                    self.request_at(nginx_port, "POST", "/v1/responses", payload, headers,
+                                    timeout=6)
+                )
+            )
+            second_client.start()
+            deadline = time.time() + 2
+            second_metrics = ""
+            while time.time() < deadline:
+                second_metrics = self.request_at(second_port, "GET", "/metrics")[2].decode()
+                if "ai_gateway_active_streams 1" in second_metrics:
+                    break
+                time.sleep(0.02)
+            self.assertIn("ai_gateway_active_streams 1", second_metrics)
+
+            first_body = first_event + first_response.read()
+            first_connection.close()
+            first_connection = None
+            self.assertTrue(first_body.endswith(b"data: [DONE]\n\n"))
+            self.assertEqual(first.wait(timeout=4), 0)
+            second_client.join(timeout=5)
+            self.assertFalse(second_client.is_alive())
+            self.assertEqual(second_result[0][0], 200)
+            self.assertTrue(second_result[0][2].endswith(b"data: [DONE]\n\n"))
+            records = [json.loads(line) for line in first_logs if line.startswith("{")]
+            self.assertTrue(any(item.get("event") == "gateway_draining" for item in records))
+            self.assertTrue(
+                any(item.get("event") == "gateway_stopped" and
+                    item.get("forced") == "false" for item in records)
+            )
+        finally:
+            if first_connection is not None:
+                first_connection.close()
+            if second_client is not None:
+                second_client.join(timeout=1)
+            nginx.terminate()
+            try:
+                nginx.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                nginx.kill()
+                nginx.wait(timeout=5)
+            self.stop_phase6_gateway(first, first_log_thread)
+            self.stop_phase6_gateway(second, second_log_thread)
+
+    @unittest.skipUnless(shutil.which("nginx"), "nginx is not installed")
+    def test_phase6_nginx_bypasses_a_hard_killed_gateway_node(self):
+        first_port, first, _, first_log_thread = self.start_phase6_gateway()
+        second_port, second, _, second_log_thread = self.start_phase6_gateway()
+        nginx_port = free_port()
+        nginx_dir = os.path.join(self.database_temp.name, "nginx-phase6-hard-failure")
+        os.makedirs(nginx_dir, exist_ok=True)
+        with open(
+            os.path.join(self.repo, "deploy", "nginx", "ai-gateway.conf.example"),
+            encoding="utf-8",
+        ) as source:
+            site = source.read()
+        site = site.replace(
+            "server 127.0.0.1:8080 max_fails=2 fail_timeout=10s;",
+            f"server 127.0.0.1:{first_port} max_fails=2 fail_timeout=10s;",
+        ).replace(
+            "server 127.0.0.1:8082 max_fails=2 fail_timeout=10s;",
+            f"server 127.0.0.1:{second_port} max_fails=2 fail_timeout=10s;",
+        ).replace("listen 8081;", f"listen {nginx_port};")
+        config_path = os.path.join(nginx_dir, "nginx.conf")
+        with open(config_path, "w", encoding="utf-8") as output:
+            output.write(
+                "worker_processes 1;\n"
+                f"pid {nginx_dir}/nginx.pid;\n"
+                f"error_log {nginx_dir}/error.log notice;\n"
+                "events { worker_connections 64; }\n"
+                "http { access_log off;\n"
+                f"{site}\n"
+                "}\n"
+            )
+        config_test = subprocess.run(
+            ["nginx", "-t", "-p", nginx_dir, "-c", config_path],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        self.assertEqual(config_test.returncode, 0, config_test.stdout)
+        nginx = subprocess.Popen(
+            ["nginx", "-p", nginx_dir, "-c", config_path, "-g", "daemon off;"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    if self.request_at(nginx_port, "GET", "/healthz", timeout=0.3)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            else:
+                self.fail("hard-failure Nginx did not become ready")
+
+            first.kill()
+            first.wait(timeout=3)
+            for _ in range(6):
+                self.assertEqual(
+                    self.request_at(nginx_port, "GET", "/healthz", timeout=2)[0],
+                    200,
+                )
+        finally:
+            nginx.terminate()
+            try:
+                nginx.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                nginx.kill()
+                nginx.wait(timeout=5)
+            self.stop_phase6_gateway(first, first_log_thread)
+            self.stop_phase6_gateway(second, second_log_thread)
+
     @unittest.skipUnless(
         shutil.which("nginx") and os.environ.get("LINGSUAN_API_KEY")
         and os.environ.get("AI_GATEWAY_RUN_LIVE_TESTS") == "1",
@@ -2150,9 +2774,21 @@ class GatewayIntegrationTest(unittest.TestCase):
         )
         live_key = self.run_admin(
             "issue-key", "--tenant", "lingsuan", "--policy", "default",
-            "--name", "phase5-live-test",
+            "--name", "phase6-live-test",
         ).stdout.strip()
         time.sleep(0.4)
+
+        live_timeouts = {
+            "AI_GATEWAY_UPSTREAM_TIMEOUT_MS": 90000,
+            "AI_GATEWAY_STREAM_IDLE_TIMEOUT_MS": 90000,
+            "AI_GATEWAY_STREAM_MAX_DURATION_MS": 180000,
+        }
+        live_primary_port, live_primary, live_primary_logs, live_primary_log_thread = (
+            self.start_phase6_gateway(**live_timeouts)
+        )
+        live_secondary_port, live_secondary, live_secondary_logs, live_secondary_log_thread = (
+            self.start_phase6_gateway(**live_timeouts)
+        )
 
         nginx_port = free_port()
         nginx_dir = os.path.join(self.database_temp.name, "nginx-lingsuan-live")
@@ -2163,8 +2799,11 @@ class GatewayIntegrationTest(unittest.TestCase):
         ) as source:
             site = source.read()
         site = site.replace(
-            "server 127.0.0.1:8080;",
-            f"server 127.0.0.1:{self.gateway_secondary_port};",
+            "server 127.0.0.1:8080 max_fails=2 fail_timeout=10s;",
+            f"server 127.0.0.1:{live_primary_port} max_fails=2 fail_timeout=10s;",
+        ).replace(
+            "server 127.0.0.1:8082 max_fails=2 fail_timeout=10s;",
+            f"server 127.0.0.1:{live_secondary_port} max_fails=2 fail_timeout=10s;",
         ).replace("listen 8081;", f"listen {nginx_port};")
         config_path = os.path.join(nginx_dir, "nginx.conf")
         with open(config_path, "w", encoding="utf-8") as output:
@@ -2210,7 +2849,20 @@ class GatewayIntegrationTest(unittest.TestCase):
                 env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 check=False, timeout=180,
             )
-            self.assertEqual(live.returncode, 0, live.stderr)
+            diagnostics = []
+            for line in [*live_primary_logs, *live_secondary_logs]:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (record.get("event") in {"attempt_completed", "request_completed"} and
+                        record.get("tenant_slug") == "lingsuan"):
+                    diagnostics.append(record)
+            self.assertEqual(
+                live.returncode, 0,
+                live.stderr + "\nSanitized Gateway records:\n" +
+                json.dumps(diagnostics, separators=(",", ":")),
+            )
             result = json.loads(live.stdout)
             self.assertEqual(result["model"], "gpt-5.6-terra")
             self.assertEqual(result["non_streaming_status"], 200)
@@ -2223,6 +2875,8 @@ class GatewayIntegrationTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 nginx.kill()
                 nginx.wait(timeout=5)
+            self.stop_phase6_gateway(live_primary, live_primary_log_thread)
+            self.stop_phase6_gateway(live_secondary, live_secondary_log_thread)
 
     def test_streaming_accepts_crlf_split_across_chunks_comments_and_multiline_data(self):
         self.provider_state.reset("stream_split_crlf")

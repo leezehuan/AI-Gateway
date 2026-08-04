@@ -138,8 +138,29 @@ public:
                               attempt_duration_sum_ms_, attempt_duration_count_);
         output << "# TYPE ai_gateway_active_upstreams gauge\n"
                << "ai_gateway_active_upstreams " << active_upstreams_ << '\n'
+               << "# TYPE ai_gateway_active_requests gauge\n"
+               << "ai_gateway_active_requests " << node_.active_requests << '\n'
                << "# TYPE ai_gateway_active_streams gauge\n"
-               << "ai_gateway_active_streams " << active_streams_ << '\n'
+               << "ai_gateway_active_streams " << node_.active_streams << '\n'
+               << "# TYPE ai_gateway_node_draining gauge\n"
+               << "ai_gateway_node_draining " << (node_.draining ? 1 : 0) << '\n'
+               << "# TYPE ai_gateway_capacity_limit gauge\n"
+               << "ai_gateway_capacity_limit{resource=\"requests\"} "
+               << node_.max_active_requests << '\n'
+               << "ai_gateway_capacity_limit{resource=\"streams\"} "
+               << node_.max_active_streams << '\n'
+               << "ai_gateway_capacity_limit{resource=\"upstream_connections\"} "
+               << node_.max_upstream_connections << '\n'
+               << "ai_gateway_capacity_limit{resource=\"upstream_host_connections\"} "
+               << node_.max_upstream_host_connections << '\n'
+               << "# TYPE ai_gateway_capacity_rejections_total counter\n"
+               << "ai_gateway_capacity_rejections_total{resource=\"requests\"} "
+               << node_.request_rejections << '\n'
+               << "ai_gateway_capacity_rejections_total{resource=\"streams\"} "
+               << node_.stream_rejections << '\n'
+               << "# TYPE ai_gateway_shutdown_cancellations_total counter\n"
+               << "ai_gateway_shutdown_cancellations_total "
+               << node_.shutdown_cancellations << '\n'
                << "# TYPE ai_gateway_failovers_total counter\n"
                << "ai_gateway_failovers_total " << failovers_ << '\n'
                << "# TYPE ai_gateway_backpressure_pauses_total counter\n"
@@ -230,7 +251,7 @@ public:
     std::uint64_t failovers_ = 0;
     std::uint64_t backpressure_pauses_ = 0;
     std::uint64_t active_upstreams_ = 0;
-    std::uint64_t active_streams_ = 0;
+    NodeSnapshot node_;
     bool mysql_ready_ = false;
     bool redis_ready_ = false;
 };
@@ -293,14 +314,10 @@ void MetricsRegistry::upstream_finished()
 
 void MetricsRegistry::stream_started()
 {
-    std::lock_guard<std::mutex> lock(impl_->mutex_);
-    ++impl_->active_streams_;
 }
 
 void MetricsRegistry::stream_finished()
 {
-    std::lock_guard<std::mutex> lock(impl_->mutex_);
-    if (impl_->active_streams_ > 0) --impl_->active_streams_;
 }
 
 void MetricsRegistry::set_dependency_readiness(bool mysql_ready, bool redis_ready)
@@ -308,6 +325,12 @@ void MetricsRegistry::set_dependency_readiness(bool mysql_ready, bool redis_read
     std::lock_guard<std::mutex> lock(impl_->mutex_);
     impl_->mysql_ready_ = mysql_ready;
     impl_->redis_ready_ = redis_ready;
+}
+
+void MetricsRegistry::set_node_state(const NodeSnapshot &snapshot)
+{
+    std::lock_guard<std::mutex> lock(impl_->mutex_);
+    impl_->node_ = snapshot;
 }
 
 std::string MetricsRegistry::render() const { return impl_->render(); }
