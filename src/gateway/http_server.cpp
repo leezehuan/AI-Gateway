@@ -18,6 +18,16 @@
 #include <string>
 #include <utility>
 
+/*
+ * Boost.Beast 入站 HTTP 适配器。
+ *
+ * 本文件不决定认证、路由或 Provider 协议，它只把 Beast request 转成 GatewayRequest，让 HttpSession
+ * 实现 ResponseWriter，并在普通 Content-Length 响应与 chunked SSE 响应之间选择正确的写法。
+ * socket EOF、写失败、SIGTERM 和 drain 会被转换为取消/完成通知。
+ *
+ * Gateway 调用 ResponseWriter::end 仅表示“不会再写业务字节”。最后一个 async_write 完成或连接断开后
+ * 才触发 completion callback，所以 NodeRequestLease 不会在慢客户端仍有积压数据时过早释放容量。
+ */
 namespace ai_gateway
 {
 namespace
@@ -27,6 +37,7 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = asio::ip::tcp;
 
+/* 将入站 Header 名称统一为小写，Gateway HeaderMap 采用大小写无关查找。 */
 std::string lower(std::string value)
 {
     for (char &character : value)
@@ -36,6 +47,7 @@ std::string lower(std::string value)
     return value;
 }
 
+/* 判断响应是否应使用 Beast HTTP/1.1 chunked SSE writer。 */
 bool event_stream_headers(const HeaderMap &headers)
 {
     const auto found = headers.find("content-type");
@@ -46,6 +58,7 @@ class HttpSession final : public ResponseWriter,
                           public std::enable_shared_from_this<HttpSession>
 {
 public:
+    /* 创建单个 TCP 连接的 HTTP 会话，并保存 body/SSE 队列上限。 */
     HttpSession(tcp::socket socket, AiGateway &gateway, const GatewayConfig &config)
         : socket_(std::move(socket)),
           gateway_(gateway),
@@ -58,11 +71,16 @@ public:
         parser_->header_limit(64 * 1024);
     }
 
+    /* 开始异步读取第一条 HTTP 请求。 */
     void start()
     {
         read_request();
     }
 
+    /*
+     * ResponseWriter begin：初始化普通响应或 SSE chunked 响应状态。
+     * SSE begin 只记录 Header，真正写出 Header 由 pump_stream 串行执行。
+     */
     void begin(int status, const HeaderMap &headers) override
     {
         {
@@ -87,6 +105,10 @@ public:
         }
     }
 
+    /*
+     * ResponseWriter write：普通响应追加 body；SSE 追加有界队列。
+     * 到达 high water 时返回 false，让上游 transport 暂停；当前 bytes 已经被队列接收。
+     */
     bool write(std::string_view bytes) override
     {
         bool stream = false;
@@ -119,6 +141,7 @@ public:
         return writable;
     }
 
+    /* 严格只接受一次 end；异步泵送完队列后才写 chunked last。 */
     void end() override
     {
         bool stream = false;
@@ -142,17 +165,20 @@ public:
         }
     }
 
+    /* 返回 socket 是否仍可写。 */
     bool client_connected() const override
     {
         return connected_.load();
     }
 
+    /* 注册低水位恢复回调，通常由 RequestExecution 调用 ProviderTransfer::resume。 */
     void set_writable_callback(std::function<void()> callback) override
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         writable_callback_ = std::move(callback);
     }
 
+    /* 注册“实际 HTTP 写完或连接断开”的严格一次回调，用于释放 NodeRequestLease。 */
     void set_completion_callback(std::function<void()> callback) override
     {
         bool call_now = false;
@@ -171,6 +197,7 @@ public:
     }
 
 private:
+    /* 使用 Beast parser 读取完整请求，并再次设置 body/header 硬上限。 */
     void read_request()
     {
         if (!connected_.load())
@@ -187,6 +214,7 @@ private:
                          });
     }
 
+    /* 把 Beast 请求转换成 GatewayRequest；解析错误在进入 Gateway 前直接返回 413/关闭。 */
     void on_read(beast::error_code error)
     {
         if (error == http::error::body_limit || error == http::error::header_limit)
@@ -226,6 +254,7 @@ private:
         gateway_.handle(request, *this, cancellation_source_.token());
     }
 
+    /* 用 peek receive 观察 EOF/reset，客户端断开时触发 CancellationSource。 */
     void monitor_disconnect()
     {
         auto self = shared_from_this();
@@ -244,6 +273,7 @@ private:
             });
     }
 
+    /* 发送普通 Content-Length 响应；写完后按 Keep-Alive 决定复用或关闭连接。 */
     void post_response()
     {
         if (!connected_.load())
@@ -282,12 +312,17 @@ private:
         });
     }
 
+    /* 把 stream pump 投递到 socket executor，保证只有一个在途 async_write。 */
     void post_stream_pump()
     {
         auto self = shared_from_this();
         asio::post(socket_.get_executor(), [self] { self->pump_stream(); });
     }
 
+    /*
+     * SSE chunked 写出状态机：先写 Header，再逐块写队列，最后写 chunk_last。
+     * 任何时刻只允许一个异步写操作，写完降到 low water 才回调上游恢复。
+     */
     void pump_stream()
     {
         if (!connected_.load())
@@ -420,6 +455,7 @@ private:
         }
     }
 
+    /* parser 阶段失败时绕过 Gateway，构造一个最小脱敏 JSON 响应。 */
     void send_direct(int status, std::string body)
     {
         request_id_ = generate_request_id();
@@ -430,6 +466,7 @@ private:
         end();
     }
 
+    /* 清理当前请求资源、触发 completion callback，并按 Keep-Alive 开始下一次读取。 */
     void release_request(bool keep_alive)
     {
         beast::error_code ignored;
@@ -456,6 +493,7 @@ private:
         }
     }
 
+    /* 幂等关闭 socket 并广播 CancellationToken。 */
     void close()
     {
         if (!connected_.exchange(false))
@@ -469,6 +507,7 @@ private:
         socket_.close(ignored);
     }
 
+    /* 严格一次通知下游写入完成，保护 NodeRequestLease 不提前释放。 */
     void notify_completion()
     {
         std::function<void()> callback;
@@ -487,6 +526,7 @@ private:
         }
     }
 
+    /* 把任意内部状态限制在合法 HTTP 状态码范围。 */
     static http::status valid_status(int status)
     {
         return status >= 100 && status <= 599
@@ -494,6 +534,7 @@ private:
                    : http::status::internal_server_error;
     }
 
+    /* 过滤 hop-by-hop 和由 Beast 自己计算的 Header，避免响应 framing 被伪造。 */
     template <typename Body>
     static void apply_headers(http::response<Body> &message, const HeaderMap &headers)
     {
@@ -545,6 +586,12 @@ private:
 };
 } // namespace
 
+/*
+ * 函数名直译：创建 HTTP 服务器。
+ *
+ * 通俗说：解析监听地址，打开 TCP socket、绑定端口并进入 listen；任何失败都在启动阶段抛出，
+ * 不让进程看似运行但实际上无法接收请求。
+ */
 HttpServer::HttpServer(const GatewayConfig &config,
                        AiGateway &gateway,
                        NodeLifecycle &lifecycle)
@@ -578,6 +625,12 @@ HttpServer::HttpServer(const GatewayConfig &config,
     }
 }
 
+/*
+ * 函数名直译：运行 HTTP 服务器。
+ *
+ * 通俗说：启动 accept、注册节点空闲回调和终止信号，再用配置数量的 Asio worker 处理会话。
+ * 活动请求归零后 listener 和 io_context 才正常停止。
+ */
 void HttpServer::run()
 {
     accept();
@@ -603,6 +656,7 @@ void HttpServer::run()
     }
 }
 
+/* 第一次 SIGINT/SIGTERM 进入自然 drain；第二次信号直接强制退出。 */
 void HttpServer::wait_for_signal()
 {
     signals_.async_wait([this](const beast::error_code &error, int) {
@@ -620,6 +674,9 @@ void HttpServer::wait_for_signal()
     });
 }
 
+/*
+ * 开始双阶段优雅停机：节点先标记 draining，停止新请求；drain_timeout 到期后取消存量上游。
+ */
 void HttpServer::begin_drain()
 {
     draining_ = true;
@@ -639,6 +696,7 @@ void HttpServer::begin_drain()
     });
 }
 
+/* 进入 shutdown cancel grace 窗口，广播取消并安排最终强制退出。 */
 void HttpServer::cancel_remaining()
 {
     if (cancelling_)
@@ -662,6 +720,7 @@ void HttpServer::cancel_remaining()
     });
 }
 
+/* 关闭 listener、timer 和 io_context；forced 路径使用 _Exit 避免悬挂依赖阻塞退出。 */
 void HttpServer::stop(bool forced)
 {
     if (stopping_)
@@ -691,6 +750,7 @@ void HttpServer::stop(bool forced)
     io_.stop();
 }
 
+/* 异步接受连接；listener 仍打开时递归安排下一次 accept。 */
 void HttpServer::accept()
 {
     acceptor_.async_accept([this](beast::error_code error, tcp::socket socket) {

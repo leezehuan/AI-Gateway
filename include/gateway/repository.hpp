@@ -13,6 +13,7 @@
 
 namespace ai_gateway
 {
+/* MySQL 查询出的逻辑模型及其 Policy 授权状态。 */
 struct RepositoryModel
 {
     std::uint64_t id = 0;
@@ -24,6 +25,7 @@ struct RepositoryModel
     std::size_t max_attempts = 3;
 };
 
+/* MySQL 查询出的 Model Mapping、Provider/Endpoint/Credential 状态和价格信息。 */
 struct RepositoryMapping
 {
     std::uint64_t mapping_id = 0;
@@ -48,6 +50,7 @@ struct RepositoryMapping
     std::optional<QuotaPolicy> credential_quota;
 };
 
+/* 当前生效的 Provider/upstream model 价格版本。 */
 struct RepositoryPrice
 {
     std::uint64_t id = 0;
@@ -60,6 +63,10 @@ struct RepositoryPrice
     std::uint64_t output_per_million_microusd = 0;
 };
 
+/*
+ * 一次一致性 Auth Snapshot 查询的扁平结果。
+ * Repository 负责关联表，RuntimeState 负责 HMAC 匹配、Secret 解析和领域对象合并。
+ */
 struct RepositoryAccessRecord
 {
     std::uint64_t config_version = 0;
@@ -82,6 +89,7 @@ struct RepositoryAccessRecord
     std::vector<RepositoryPrice> prices;
 };
 
+/* request_attempts.started 的内部 ID 关联和候选资源身份。 */
 struct AttemptStart
 {
     std::string attempt_id;
@@ -97,6 +105,7 @@ struct AttemptStart
     bool stream = false;
 };
 
+/* Provider Usage、价格和计费质量的统一表示。 */
 struct UsageAccounting
 {
     std::optional<std::uint64_t> input_tokens;
@@ -108,6 +117,7 @@ struct UsageAccounting
     std::string cost_quality = "unknown";
 };
 
+/* request_attempts 的幂等终态更新内容。 */
 struct AttemptFinish
 {
     std::string attempt_id;
@@ -123,6 +133,7 @@ struct AttemptFinish
     UsageAccounting usage;
 };
 
+/* 请求级 Redis RPM/并发与 MySQL 日/月预算准入参数。 */
 struct RequestAdmission
 {
     std::string request_id;
@@ -162,6 +173,7 @@ struct RequestFinish
     UsageAccounting usage;
 };
 
+/* 非计费健康探测的数据库配置及其关联候选。 */
 struct RepositoryHealthCheck
 {
     std::uint64_t id = 0;
@@ -184,15 +196,24 @@ struct RepositoryHealthCheck
 class GatewayRepository
 {
 public:
+    /* Repository 是 RuntimeState 的阻塞 SQL seam，生产实现使用 prepared statements。 */
     virtual ~GatewayRepository() = default;
+    /* 读取 gateway_config_versions 当前版本。 */
     virtual std::uint64_t config_version() = 0;
+    /* 按 Key display prefix 加载一致性认证候选。 */
     virtual std::vector<RepositoryAccessRecord> load_access_candidates(
         const std::string &display_prefix) = 0;
+    /* 创建 Usage started 并预留预算。 */
     virtual RequestAdmissionStatus admit_request(const RequestAdmission &request) = 0;
+    /* 幂等结算 Usage、预算和最终候选。 */
     virtual void finish_request(const RequestFinish &request) = 0;
+    /* 加载显式健康探测配置。 */
     virtual std::vector<RepositoryHealthCheck> load_health_checks() = 0;
+    /* 协调超时 started Usage 为 abandoned/unknown。 */
     virtual void reconcile_abandoned_requests() = 0;
+    /* 写入唯一 Attempt started。 */
     virtual void begin_attempt(const AttemptStart &attempt) = 0;
+    /* 更新 Attempt 终态和 Usage。 */
     virtual void finish_attempt(const AttemptFinish &attempt) = 0;
 };
 

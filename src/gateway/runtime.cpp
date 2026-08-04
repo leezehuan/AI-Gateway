@@ -23,12 +23,20 @@
 #include <thread>
 #include <utility>
 
+/*
+ * 身份与配置运行时。
+ *
+ * RuntimeState 将阻塞的 MySQL Repository 隔离到固定 worker pool：HTTP 线程只投递任务和接收回调。
+ * 它组合 AuthSnapshot、验证 API Key HMAC、解析 env:/file: Secret 引用、缓存认证结果并轮询配置版本。
+ * 版本轮询或数据库失败时立即 fail closed，即使本地缓存命中也不继续认证，避免禁用 Key 后出现权限窗口。
+ */
 namespace ai_gateway
 {
 namespace
 {
 using Clock = std::chrono::steady_clock;
 
+/* 把二进制摘要转换成固定长度十六进制文本，供日志外的公开 fingerprint 使用。 */
 std::string hex(const unsigned char *bytes, std::size_t size)
 {
     std::ostringstream output;
@@ -40,6 +48,7 @@ std::string hex(const unsigned char *bytes, std::size_t size)
     return output.str();
 }
 
+/* 使用进程配置的 HMAC pepper 对完整 Gateway Key 做不可逆校验摘要。 */
 std::string hmac_key(const std::string &pepper, const std::string &key)
 {
     unsigned char digest[EVP_MAX_MD_SIZE];
@@ -53,6 +62,7 @@ std::string hmac_key(const std::string &pepper, const std::string &key)
     return std::string(reinterpret_cast<char *>(digest), digest_size);
 }
 
+/* 根据配置版本和数据库 mapping 身份计算不含 Secret 的候选指纹。 */
 std::string candidate_fingerprint(std::uint64_t config_version,
                                   const RepositoryMapping &mapping)
 {
@@ -65,12 +75,14 @@ std::string candidate_fingerprint(std::uint64_t config_version,
     return hex(digest, sizeof(digest));
 }
 
+/* RepositoryAccessRecord 版本的候选指纹重载。 */
 std::string candidate_fingerprint(const RepositoryAccessRecord &record,
                                   const RepositoryMapping &mapping)
 {
     return candidate_fingerprint(record.config_version, mapping);
 }
 
+/* 常量时间比较两个摘要，避免 Key 校验因首个不同字节泄漏比较进度。 */
 bool constant_time_equal(std::string_view left, std::string_view right)
 {
     std::size_t difference = left.size() ^ right.size();
@@ -84,6 +96,7 @@ bool constant_time_equal(std::string_view left, std::string_view right)
     return difference == 0;
 }
 
+/* 校验 aigw_<12字符前缀>_<43字符base64url> 格式并提取公开前缀。 */
 bool parse_key(const std::string &key, std::string &prefix)
 {
     static const std::regex format("^aigw_([A-Za-z0-9_-]{12})_[A-Za-z0-9_-]{43}$");
@@ -96,11 +109,13 @@ bool parse_key(const std::string &key, std::string &prefix)
     return true;
 }
 
+/* Provider Endpoint 只允许管理员配置的 HTTP(S) URL。 */
 bool supported_url(const std::string &url)
 {
     return url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0;
 }
 
+/* 删除 Secret 文件末尾换行，并拒绝空 Secret。 */
 std::string trim_secret(std::string value)
 {
     while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
@@ -114,6 +129,17 @@ std::string trim_secret(std::string value)
     return value;
 }
 
+/*
+ * 函数名直译：解析 Provider Secret 引用。
+ *
+ * 通俗说：数据库只保存 env:NAME 或 file:basename，不保存真实密钥；请求真正要发给 Provider
+ * 时才从环境变量或安全目录读取，并且不允许路径穿越、符号链接和超过 64 KiB 的文件。
+ *
+ * 专业说法：这是 Credential Secret Adapter，使用 openat + O_NOFOLLOW 约束文件边界。
+ *
+ * 参数说明：config 提供 Secret 目录；reference 是数据库中的引用字符串。
+ * 返回值：真实 Secret，仅供内存中的 ProviderRequest 使用；解析失败抛出脱敏异常。
+ */
 std::string resolve_secret(const GatewayConfig &config, const std::string &reference)
 {
     if (reference.rfind("env:", 0) == 0)
@@ -178,6 +204,18 @@ std::string resolve_secret(const GatewayConfig &config, const std::string &refer
     return trim_secret(std::move(value));
 }
 
+/*
+ * 函数名直译：构造鉴权结果。
+ *
+ * 通俗说：从同一个 Key 前缀查出的候选记录中，常量时间比较 HMAC，确认 Key/Tenant/Policy
+ * 未禁用且未过期，然后合并协议 grant、模型 grant、Provider grant 和 Mapping，形成一次不可变快照。
+ *
+ * 专业说法：这是 RuntimeState 的 Auth Snapshot builder；它在数据库线程执行，负责把多张关系表
+ * 的一致性查询结果压缩为请求线程可读的领域对象。
+ *
+ * 注意：任何 Secret、URL 不可用或 Mapping 关联不一致只会标记配置不可用/跳过候选，不把底层异常
+ * 透传给客户端。
+ */
 AuthResult build_result(const GatewayConfig &config,
                         const std::vector<RepositoryAccessRecord> &records,
                         const std::string &candidate_hmac)
@@ -299,6 +337,7 @@ AuthResult build_result(const GatewayConfig &config,
 class RuntimeState::Impl
 {
 public:
+    /* 启动固定数量数据库 worker，并启动配置版本轮询线程。 */
     Impl(GatewayConfig config, GatewayRepository &repository)
         : config_(std::move(config)), repository_(repository)
     {
@@ -310,6 +349,7 @@ public:
         poller_ = std::thread([this] { poll_loop(); });
     }
 
+    /* 停止接收新任务，唤醒并等待 poller/worker，保证析构后没有后台线程访问成员。 */
     ~Impl()
     {
         stopping_.store(true);
@@ -328,6 +368,7 @@ public:
         }
     }
 
+    /* 在 worker 线程完成 HMAC、缓存查询和 Repository Auth Snapshot 加载。 */
     void authenticate(std::string key, AuthCallback callback)
     {
         std::string prefix;
@@ -400,6 +441,7 @@ public:
         }
     }
 
+    /* 写入一次 Provider 调用前的 started Attempt；失败时不允许真正发起请求。 */
     void begin_attempt(AttemptStart attempt, AuditCallback callback)
     {
         auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
@@ -428,6 +470,7 @@ public:
         }
     }
 
+    /* 创建请求级 Usage 和预算预留，并返回 Governance/数据库准入状态。 */
     void admit_request(RequestAdmission request, AdmissionCallback callback)
     {
         auto shared_callback = std::make_shared<AdmissionCallback>(std::move(callback));
@@ -448,6 +491,7 @@ public:
         }
     }
 
+    /* 以有限重试写入请求终态；连续失败会使 RuntimeState readiness 失败。 */
     void finish_request(RequestFinish request, AuditCallback callback)
     {
         auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
@@ -481,6 +525,7 @@ public:
         }
     }
 
+    /* 从数据库加载显式配置的非计费健康探测目标。 */
     void load_health_checks(HealthCheckCallback callback)
     {
         auto shared_callback = std::make_shared<HealthCheckCallback>(std::move(callback));
@@ -523,6 +568,7 @@ public:
         }
     }
 
+    /* 幂等更新 Attempt 终态和 Usage 字段，并在失败时 fail closed。 */
     void finish_attempt(AttemptFinish attempt, AuditCallback callback)
     {
         auto shared_callback = std::make_shared<AuditCallback>(std::move(callback));
@@ -562,7 +608,10 @@ public:
         }
     }
 
+    /* 数据库版本轮询成功且未发生 fail_closed 时才允许新的鉴权请求。 */
     bool ready() const { return ready_.load(); }
+
+    /* 返回只读进程配置，不暴露 worker/缓存内部状态。 */
     const GatewayConfig &config() const { return config_; }
 
 private:
@@ -573,6 +622,10 @@ private:
         std::list<std::string>::iterator lru;
     };
 
+    /*
+     * 把数据库相关任务放入有界队列。
+     * 队列满或正在停止时返回 false，使调用方立即返回 unavailable，而不是无限堆积请求。
+     */
     bool enqueue(std::function<void()> task)
     {
         {
@@ -587,6 +640,7 @@ private:
         return true;
     }
 
+    /* 固定 worker 的消费循环；任务异常被隔离，避免一个 SQL 失败杀死整个线程。 */
     void worker_loop()
     {
         while (true)
@@ -614,6 +668,7 @@ private:
         }
     }
 
+    /* 按配置间隔投递版本轮询任务，真正 SQL 仍由 worker 队列执行。 */
     void poll_loop()
     {
         std::unique_lock<std::mutex> lock(poll_mutex_);
@@ -629,6 +684,10 @@ private:
         }
     }
 
+    /*
+     * 投递一次配置版本/遗留 Usage 协调任务。
+     * poll_pending_ 防止慢数据库时多个定时 tick 在队列中累积；任意失败清空缓存并 fail closed。
+     */
     void enqueue_poll()
     {
         bool expected = false;
@@ -655,6 +714,7 @@ private:
         }
     }
 
+    /* 版本变化意味着 Policy/Mapping/Key 可能已修改，必须立刻失效所有 Auth Snapshot 缓存。 */
     void apply_version(std::uint64_t version)
     {
         const std::uint64_t previous = version_.exchange(version);
@@ -664,12 +724,14 @@ private:
         }
     }
 
+    /* 外部身份依赖异常时停止使用旧缓存继续鉴权，readyz 也随之变为 503。 */
     void fail_closed()
     {
         ready_.store(false);
         clear_cache();
     }
 
+    /* 在 TTL 内读取并更新 LRU 顺序；缓存 key 是 HMAC 的十六进制形式而非完整 API Key。 */
     std::shared_ptr<AuthResult> find_cache(const std::string &key)
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -690,6 +752,7 @@ private:
         return std::make_shared<AuthResult>(found->second.result);
     }
 
+    /* 写入 AuthResult，并在超过最大条目数时淘汰最久未使用项。 */
     void put_cache(const std::string &key, const AuthResult &result)
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -708,6 +771,7 @@ private:
         }
     }
 
+    /* 在配置变化和依赖故障时统一清空缓存。 */
     void clear_cache()
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -733,38 +797,46 @@ private:
     std::unordered_map<std::string, CacheEntry> cache_;
 };
 
+/* 创建 RuntimeState 外观，Impl 接管线程、队列、缓存和 Repository 引用。 */
 RuntimeState::RuntimeState(GatewayConfig config, GatewayRepository &repository)
     : impl_(std::make_unique<Impl>(std::move(config), repository))
 {
 }
 
+/* 析构由 Impl 等待所有后台线程退出。 */
 RuntimeState::~RuntimeState() = default;
 
+/* 把 API Key 和回调转交给异步实现，调用者线程不执行 SQL。 */
 void RuntimeState::authenticate(std::string api_key, AuthCallback callback)
 {
     impl_->authenticate(std::move(api_key), std::move(callback));
 }
 
+/* 转交 started Attempt 审计请求。 */
 void RuntimeState::begin_attempt(AttemptStart attempt, AuditCallback callback)
 {
     impl_->begin_attempt(std::move(attempt), std::move(callback));
 }
 
+/* 转交 Usage/预算准入事务。 */
 void RuntimeState::admit_request(RequestAdmission request, AdmissionCallback callback)
 {
     impl_->admit_request(std::move(request), std::move(callback));
 }
 
+/* 转交请求终态结算。 */
 void RuntimeState::finish_request(RequestFinish request, AuditCallback callback)
 {
     impl_->finish_request(std::move(request), std::move(callback));
 }
 
+/* 转交健康探测配置加载。 */
 void RuntimeState::load_health_checks(HealthCheckCallback callback)
 {
     impl_->load_health_checks(std::move(callback));
 }
 
+/* 转交 Attempt 终态审计。 */
 void RuntimeState::finish_attempt(AttemptFinish attempt, AuditCallback callback)
 {
     impl_->finish_attempt(std::move(attempt), std::move(callback));

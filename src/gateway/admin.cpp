@@ -24,6 +24,14 @@
 #include <utility>
 #include <vector>
 
+/*
+ * AiGatewayAdmin 离线管理命令。
+ *
+ * 它是唯一可以写 Gateway 配置、执行 migration、签发 API Key 的入口，不提供管理 HTTP API。
+ * 所有运行时 DML 使用 prepared statement；migration 是仓库受控的静态 SQL。apply-config 采用
+ * “省略不删除”的事务化 upsert 语义，成功变更只 bump 一次版本，从而通知所有 Gateway 节点清除缓存。
+ * 完整 API Key 只在 issue-key 成功提交后通过 stdout 输出一次，数据库和日志都只保存公开 ID/前缀/HMAC。
+ */
 namespace
 {
 using json = nlohmann::json;
@@ -32,12 +40,20 @@ using ai_gateway::MySqlConnection;
 class Transaction
 {
 public:
+    /*
+     * 函数名直译：事务构造函数。
+ *
+     * 通俗说：创建对象时立即开始数据库事务；后续任一配置写入出错，析构函数会自动回滚。
+ *
+     * 专业说法：这是管理命令的 RAII transaction guard，避免大量手写 try/catch 后遗漏 ROLLBACK。
+     */
     explicit Transaction(MySqlConnection &connection)
         : connection_(connection)
     {
         connection_.begin();
     }
 
+    /* 未显式提交的事务在作用域结束时回滚，保持配置变更原子性。 */
     ~Transaction()
     {
         if (!committed_)
@@ -46,6 +62,7 @@ public:
         }
     }
 
+    /* 提交事务并标记已完成，阻止析构时再次回滚。 */
     void commit()
     {
         connection_.commit();
@@ -57,6 +74,13 @@ private:
     bool committed_ = false;
 };
 
+/*
+ * 函数名直译：解析命令选项。
+ *
+ * 通俗说：把 `--name value` 形式的 CLI 参数收集为表；缺值、非 -- 开头或重复选项立即报错。
+ *
+ * 专业说法：AiGatewayAdmin 有意采用小而严格的成对参数语法，避免命令行输入产生含糊解释。
+ */
 std::unordered_map<std::string, std::string> parse_options(int argc, char **argv, int offset)
 {
     std::unordered_map<std::string, std::string> options;
@@ -75,6 +99,7 @@ std::unordered_map<std::string, std::string> parse_options(int argc, char **argv
     return options;
 }
 
+/* 读取必填 CLI 选项，空字符串也视为缺失。 */
 std::string require_option(const std::unordered_map<std::string, std::string> &options,
                            const std::string &name)
 {
@@ -86,6 +111,15 @@ std::string require_option(const std::unordered_map<std::string, std::string> &o
     return found->second;
 }
 
+/*
+ * 函数名直译：读取文件。
+ *
+ * 通俗说：读取迁移 SQL 或 JSON 配置，并在进入 JSON 解析/SQL 执行前限制大小。
+ *
+ * 专业说法：使用二进制流保留原始迁移内容，保证 checksum 与实际执行字节一致。
+ *
+ * 注意：错误信息仅包含文件名，不回显文件正文。
+ */
 std::string read_file(const std::filesystem::path &path, std::size_t maximum = 8 * 1024 * 1024)
 {
     std::ifstream input(path, std::ios::binary);
@@ -103,6 +137,7 @@ std::string read_file(const std::filesystem::path &path, std::size_t maximum = 8
     return result;
 }
 
+/* 将二进制 hash/随机值转为可输出、可存储的十六进制文本。 */
 std::string hex(const unsigned char *bytes, std::size_t size)
 {
     std::ostringstream output;
@@ -114,6 +149,7 @@ std::string hex(const unsigned char *bytes, std::size_t size)
     return output.str();
 }
 
+/* 计算迁移文件 SHA-256，用于阻止已执行 migration 被静默篡改。 */
 std::string sha256(const std::string &contents)
 {
     unsigned char digest[SHA256_DIGEST_LENGTH];
@@ -121,6 +157,13 @@ std::string sha256(const std::string &contents)
     return hex(digest, sizeof(digest));
 }
 
+/*
+ * 函数名直译：Base64 URL 编码。
+ *
+ * 通俗说：把安全随机字节编码成适合放在 API Key 中的 URL 安全文本，不使用 +、/、=。
+ *
+ * 专业说法：这是无 padding 的 base64url 编码，生成 aigw_ 前缀和公开随机 ID 的组成部分。
+ */
 std::string base64url(const unsigned char *bytes, std::size_t size)
 {
     static const char alphabet[] =
@@ -146,6 +189,7 @@ std::string base64url(const unsigned char *bytes, std::size_t size)
     return result;
 }
 
+/* 从 OpenSSL CSPRNG 取得随机字节；失败时拒绝签发 Key，不能退化到伪随机数。 */
 std::vector<unsigned char> random_bytes(std::size_t size)
 {
     std::vector<unsigned char> bytes(size);
@@ -156,6 +200,7 @@ std::vector<unsigned char> random_bytes(std::size_t size)
     return bytes;
 }
 
+/* 校验 slug/name 可安全作为稳定资源名称，拒绝空白、路径字符和超长值。 */
 void validate_name(const std::string &value, const std::string &field)
 {
     static const std::regex pattern("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$");
@@ -165,6 +210,7 @@ void validate_name(const std::string &value, const std::string &field)
     }
 }
 
+/* Gateway 配置实体目前只有 active 与 disabled 两种可持久化状态。 */
 void validate_status(const std::string &status)
 {
     if (status != "active" && status != "disabled")
@@ -173,6 +219,7 @@ void validate_status(const std::string &status)
     }
 }
 
+/* 校验 Phase 4 已支持的三种候选调度策略。 */
 void validate_scheduling_mode(const std::string &mode)
 {
     if (mode != "fixed_order" && mode != "load_balance" && mode != "cache_affinity")
@@ -182,6 +229,7 @@ void validate_scheduling_mode(const std::string &mode)
     }
 }
 
+/* 管理面只接受管理员配置的 HTTP(S) Provider URL，仍不允许客户端指定上游。 */
 void validate_url(const std::string &url)
 {
     if ((url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) ||
@@ -191,6 +239,7 @@ void validate_url(const std::string &url)
     }
 }
 
+/* Credential 数据库只保存 env:NAME 或 file:basename 引用，禁止完整 Secret 与路径穿越。 */
 void validate_secret_ref(const std::string &reference)
 {
     static const std::regex environment("^env:[A-Za-z_][A-Za-z0-9_]*$");
@@ -203,6 +252,7 @@ void validate_secret_ref(const std::string &reference)
 
 std::string normalize_expiry(std::string value);
 
+/* JSON 中可选的非负整数配额字段转换为 prepared-statement 参数文本。 */
 std::string optional_unsigned(const json &object, const char *field)
 {
     if (!object.contains(field) || object[field].is_null())
@@ -218,6 +268,13 @@ std::string optional_unsigned(const json &object, const char *field)
     return std::to_string(object[field].get<unsigned long long>());
 }
 
+/*
+ * 函数名直译：美元微单位。
+ *
+ * 通俗说：把例如 "0.10" 的十进制美元字符串精确转换为 100000 micro-USD。
+ *
+ * 专业说法：禁止浮点数，使用最多六位小数和整数运算，避免预算与价格在不同机器上出现舍入误差。
+ */
 std::uint64_t usd_microunits(const std::string &value, const std::string &field)
 {
     static const std::regex pattern("^([0-9]{1,12})(?:\\.([0-9]{1,6}))?$");
@@ -236,6 +293,7 @@ std::uint64_t usd_microunits(const std::string &value, const std::string &field)
     return whole * 1000000ULL + (fraction.empty() ? 0ULL : std::stoull(fraction));
 }
 
+/* 读取可选 USD 字段，null/缺失表示不设置上限。 */
 std::string optional_money(const json &object, const char *field)
 {
     if (!object.contains(field) || object[field].is_null())
@@ -249,6 +307,13 @@ std::string optional_money(const json &object, const char *field)
     return std::to_string(usd_microunits(object[field].get<std::string>(), field));
 }
 
+/*
+ * 函数名直译：必填字段。
+ *
+ * 通俗说：确保配置对象具有指定名称且 JSON 类型正确的字段，再把引用交给调用者。
+ *
+ * 专业说法：集中提供 apply-config 的结构校验；业务语义校验仍由各资源循环完成。
+ */
 const json &required(const json &object, const char *field, json::value_t type)
 {
     if (!object.is_object() || !object.contains(field) || object[field].type() != type)
@@ -258,6 +323,7 @@ const json &required(const json &object, const char *field, json::value_t type)
     return object[field];
 }
 
+/* 读取非空必填字符串，空值不允许充当资源名称或 Secret 引用。 */
 std::string required_string(const json &object, const char *field)
 {
     const std::string value = required(object, field, json::value_t::string).get<std::string>();
@@ -268,6 +334,7 @@ std::string required_string(const json &object, const char *field)
     return value;
 }
 
+/* 缺少数组字段表示“本次不修改这类记录”，而不是清空数据库已有记录。 */
 const json &array_or_empty(const json &root, const char *field)
 {
     static const json empty = json::array();
@@ -282,6 +349,7 @@ const json &array_or_empty(const json &root, const char *field)
     return root[field];
 }
 
+/* 取得可选 status，默认 active，并强制校验可选值范围。 */
 std::string status_of(const json &object)
 {
     const std::string status = object.value("status", "active");
@@ -289,6 +357,14 @@ std::string status_of(const json &object)
     return status;
 }
 
+/*
+ * 函数名直译：要求 ID。
+ *
+ * 通俗说：根据已存在资源查数据库 ID；引用了不存在的 Tenant、Provider、模型等配置会立刻失败，
+ * 不会写出悬空外键。
+ *
+ * 专业说法：所有 SQL 仍经 prepared statement 执行；查询必须恰好返回一行。
+ */
 std::uint64_t require_id(MySqlConnection &connection,
                          const std::string &sql,
                          const std::vector<std::string> &parameters,
@@ -302,6 +378,7 @@ std::uint64_t require_id(MySqlConnection &connection,
     return std::stoull(rows.front().front());
 }
 
+/* 执行一个 upsert，并把数据库报告的真实变更累计到 changed，供最后一次性 bump version。 */
 std::uint64_t upsert(MySqlConnection &connection,
                      const std::string &sql,
                      const std::vector<std::string> &parameters,
@@ -311,6 +388,7 @@ std::uint64_t upsert(MySqlConnection &connection,
     return connection.last_insert_id();
 }
 
+/* 兼容简写字符串和 {name, enabled} 对象两种 Policy grant JSON 写法。 */
 std::pair<std::string, bool> grant_value(const json &value)
 {
     if (value.is_string())
@@ -324,12 +402,28 @@ std::pair<std::string, bool> grant_value(const json &value)
     throw std::runtime_error("grant must be a name or an object with name and enabled");
 }
 
+/* 配置生效信号：一次事务中任意有效变更只调用一次，促使 Gateway 节点失效缓存。 */
 void bump_version(MySqlConnection &connection)
 {
     connection.execute_prepared(
         "UPDATE gateway_config_versions SET version = version + 1 WHERE singleton_id = 1");
 }
 
+/*
+ * 函数名直译：迁移数据库。
+ *
+ * 通俗说：按文件名顺序执行未运行过的 .sql migration，并记录每个文件的 SHA-256；
+ * 已运行文件内容被修改时拒绝继续，防止不同节点拥有表面相同、实际不同的 Schema。
+ *
+ * 专业说法：schema_migrations 是 append-only migration ledger；DDL 仅来自受控 SQL 文件，
+ * 而运行时数据操作始终使用 prepared statement。
+ *
+ * 参数说明：
+ * - connection：管理员专用数据库连接。
+ * - directory：migration 文件目录。
+ *
+ * 注意：本函数不回滚已经独立成功的历史 migration；修订 Schema 必须新增版本文件。
+ */
 void migrate(MySqlConnection &connection, const std::filesystem::path &directory)
 {
     if (!std::filesystem::is_directory(directory))
@@ -381,6 +475,24 @@ void migrate(MySqlConnection &connection, const std::filesystem::path &directory
     }
 }
 
+/*
+ * 函数名直译：应用配置。
+ *
+ * 通俗说：把 JSON 配置中的租户、Provider、Credential 引用、配额、模型、Policy、Mapping、价格和健康探测
+ * 写入数据库。未出现在 JSON 里的既有记录保持不动，避免一次局部配置意外删除生产资源。
+ *
+ * 专业说法：这是事务化、按资源 upsert 的管理面。所有引用先解析为同租户 ID；任一步校验/SQL 失败会回滚，
+ * 只有实际发生变更时才在同一事务内递增 gateway_config_versions 一次。
+ *
+ * 参数说明：
+ * - connection：管理员数据库连接。
+ * - root：已经解析的配置 JSON 根对象。
+ *
+ * 实现方法：按依赖顺序处理 Tenant、Provider/Endpoint/Credential、Quota、绑定、逻辑模型/路由、
+ * Policy grants、Mapping、不可变价格版本和显式健康检查，最后提交事务。
+ *
+ * 注意：secret_ref 是引用而非 Secret；完整 Provider Key 不进入 JSON 持久化。
+ */
 void apply_config(MySqlConnection &connection, const json &root)
 {
     if (!root.is_object())
@@ -751,6 +863,7 @@ void apply_config(MySqlConnection &connection, const json &root)
             "FROM model_prices WHERE provider_id=? AND upstream_model=? AND version=?",
             {effective_at, input, cached, output, std::to_string(provider_id), upstream_model,
              version});
+        // Phase 5 价格版本的费率和生效时间不可覆盖；管理员需要新建 version 来修订历史价格。
         if (existing.empty())
         {
             upsert(connection,
@@ -829,6 +942,13 @@ void apply_config(MySqlConnection &connection, const json &root)
     transaction.commit();
 }
 
+/*
+ * 函数名直译：规范化过期时间。
+ *
+ * 通俗说：校验 CLI 提供的 RFC3339 时间，验证日期确实存在，处理 UTC 偏移后转换为数据库统一使用的 UTC 文本。
+ *
+ * 专业说法：避免把有歧义的本地时区时间直接写入 expires_at；秒以下精度按输入保留到最多六位。
+ */
 std::string normalize_expiry(std::string value)
 {
     if (value.empty())
@@ -882,12 +1002,24 @@ std::string normalize_expiry(std::string value)
     return std::string(formatted) + match[7].str();
 }
 
+/* API Key 签发结果：完整 key 只能写 stdout 一次，public_id 可安全显示在后续管理输出中。 */
 struct IssuedKey
 {
     std::string key;
     std::string public_id;
 };
 
+/*
+ * 函数名直译：签发密钥。
+ *
+ * 通俗说：为一个 Tenant 和 Access Policy 生成格式为 aigw_<prefix>_<secret> 的新 Key，
+ * 数据库只保存可展示前缀、公开 ID 和 HMAC，永远不保存完整 Key。
+ *
+ * 专业说法：使用 CSPRNG 生成 prefix、32-byte secret 和 public ID；HMAC-SHA256 使用 Gateway pepper，
+ * 事务提交后递增配置版本，使各节点认证缓存尽快失效。
+ *
+ * 注意：返回值中的 key 是唯一一次可恢复明文，调用 main 仅把它输出到 stdout，绝不写日志。
+ */
 IssuedKey issue_key(MySqlConnection &connection,
                     const ai_gateway::GatewayConfig &config,
                     const std::string &tenant_slug,
@@ -940,6 +1072,7 @@ IssuedKey issue_key(MySqlConnection &connection,
     return {key, key_id};
 }
 
+/* 修改 API Key 的可选 Quota Policy 绑定；none 显式清除绑定，变更后才 bump 配置版本。 */
 void set_key_quota(MySqlConnection &connection,
                    const std::string &key_id,
                    const std::string &quota_slug)
@@ -969,6 +1102,7 @@ void set_key_quota(MySqlConnection &connection,
     transaction.commit();
 }
 
+/* 修改 API Key 的 active/disabled 状态，并通过版本递增让热缓存立即失效。 */
 void set_key_status(MySqlConnection &connection,
                     const std::string &key_id,
                     const std::string &status)
@@ -994,6 +1128,16 @@ void set_key_status(MySqlConnection &connection,
 }
 } // namespace
 
+/*
+ * 函数名直译：管理命令主函数。
+ *
+ * 通俗说：根据第一个命令词执行迁移、应用配置、签发 Key、修改 Key 状态/配额或手动递增配置版本。
+ *
+ * 专业说法：AiGatewayAdmin 是离线管理 CLI，不开放 HTTP 管理接口；它与运行时共享 DatabaseConfig 和 HMAC pepper，
+ * 但绝不启动 HTTP server、Redis worker 或 Provider transport。
+ *
+ * 注意：issue-key 的完整 Key 只从 stdout 输出一次；其余错误只输出必要诊断，不回显 JSON 配置或 Secret。
+ */
 int main(int argc, char **argv)
 {
     try

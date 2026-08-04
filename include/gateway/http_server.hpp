@@ -16,10 +16,17 @@
 
 namespace ai_gateway
 {
+/*
+ * Beast 入站服务器。
+ *
+ * 每个 HttpSession 实现 ResponseWriter，把普通 JSON 作为 Content-Length 响应，把 SSE
+ * 作为 HTTP/1.1 chunked 响应；HttpServer 只负责 listener、signal、drain 和 io_context 生命周期。
+ */
 class HttpServer
 {
 public:
     HttpServer(const GatewayConfig &config, AiGateway &gateway, NodeLifecycle &lifecycle);
+    /* 启动 accept、signal handler 和配置数量的 Asio worker。 */
     void run();
 
 private:

@@ -12,6 +12,7 @@
 
 namespace ai_gateway
 {
+/* Redis 中保存的单个候选健康分、熔断和 half-open probe 状态。 */
 struct CandidateRoutingState
 {
     int health_score = 100;
@@ -19,6 +20,7 @@ struct CandidateRoutingState
     bool half_open_probe = false;
 };
 
+/* 路由查询得到的 affinity 目标和每个候选的共享运行态。 */
 struct RoutingSnapshot
 {
     std::optional<std::string> affinity_target;
@@ -28,6 +30,7 @@ struct RoutingSnapshot
 class RoutingStore
 {
 public:
+    /* RoutingStore 是 Redis 路由状态 seam；不可用时不应退化到节点本地状态。 */
     virtual ~RoutingStore() = default;
     virtual bool ping() = 0;
     virtual std::optional<RoutingSnapshot> snapshot(
@@ -109,7 +112,9 @@ public:
     RoutingRuntime(const RoutingRuntime &) = delete;
     RoutingRuntime &operator=(const RoutingRuntime &) = delete;
 
+    /* 异步按调度模式、健康状态和 session affinity 生成候选顺序。 */
     void plan(RouteRequest request, PlanCallback callback);
+    /* 返回路由 Redis 是否 ready。 */
     void record(std::string candidate_fingerprint,
                 std::string affinity_key,
                 bool success,
