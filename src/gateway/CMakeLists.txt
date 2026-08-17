@@ -101,4 +101,11 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
                 ${PROJECT_SOURCE_DIR}/tests/gateway/test_deployment_assets.py
                 ${PROJECT_SOURCE_DIR}
     )
+
+    add_test(
+        NAME ai_gateway.cluster_stress.unit
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/gateway/test_cluster_stress.py
+    )
+    set_tests_properties(ai_gateway.cluster_stress.unit PROPERTIES TIMEOUT 10)
 endif()

@@ -1,5 +1,7 @@
 # C++ AI Gateway
 
+中文使用说明见 [docs/USAGE_CN.md](docs/USAGE_CN.md)。
+
 This repository builds a multi-tenant HTTP/SSE AI API gateway. The default build contains
 `AiGateway` and `AiGatewayAdmin`; the gateway is independent of the archived pre-migration
 application under `legacy/`.
