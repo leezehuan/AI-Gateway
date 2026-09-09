@@ -9,7 +9,7 @@
 
 namespace ai_gateway
 {
-/* Gateway 专用数据库连接配置；不复用 Legacy 聊天数据库凭据。 */
+/* Gateway 专用数据库连接配置。 */
 struct DatabaseConfig
 {
     std::string host = "127.0.0.1";

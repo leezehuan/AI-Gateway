@@ -1,6 +1,10 @@
 .env
 build/*
 !build/compile.md
-/Aether/
+# 本地历史资料不纳入仓库
+/legacy/
+/ai-api-gateway-migration-spec.md
+/docs/legacy-baseline.md
+/plan/
 __pycache__/
 *.pyc

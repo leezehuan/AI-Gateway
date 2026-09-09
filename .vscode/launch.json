@@ -16,19 +16,6 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "preLaunchTask": "构建 JSON 测试"
-        },
-        {
-            "name": "调试 Muduo 测试",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/test/testmuduo/muduo_server",
-            "args": [],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "gdb",
-            "preLaunchTask": "构建 Muduo 测试"
         }
     ]
 }

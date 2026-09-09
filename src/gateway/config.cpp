@@ -111,7 +111,7 @@ GatewayConfig GatewayConfig::from_env()
     config.listen_address = env_string("AI_GATEWAY_LISTEN_ADDRESS", "127.0.0.1");
     config.listen_port = env_number<std::uint16_t>(
         "AI_GATEWAY_LISTEN_PORT", 8080, 1, std::numeric_limits<std::uint16_t>::max());
-    // Gateway 身份、策略和 Usage 均存放在独立数据库，不复用 Legacy 聊天连接。
+    // Gateway 身份、策略和 Usage 均存放在独立数据库。
     config.database.host = env_string("AI_GATEWAY_DB_HOST", "127.0.0.1");
     config.database.port = env_number<std::uint16_t>(
         "AI_GATEWAY_DB_PORT", 3306, 1, std::numeric_limits<std::uint16_t>::max());

@@ -1,7 +1,7 @@
 # AI Gateway
 
 The AI Gateway context controls who may access an AI model and which upstream resource fulfills
-that access. It is separate from the legacy cluster-chat context.
+that access.
 
 ## Language
 
@@ -11,7 +11,7 @@ _Avoid_: User, account, customer
 
 **API Key**:
 A bearer credential issued to a Tenant and bound to exactly one Access Policy. It identifies
-machine access, not a legacy chat User.
+machine access, not an interactive user account.
 _Avoid_: Password, Provider key
 
 **Access Policy**:
@@ -131,7 +131,7 @@ _Avoid_: HTTP Handler, Provider
 **Chat Completions**:
 The OpenAI-compatible `/v1/chat/completions` protocol using a `messages` array and optional native
 data-only SSE.
-_Avoid_: Responses request, legacy message protocol
+_Avoid_: Responses request, unrelated message protocol
 
 **Anthropic Messages**:
 The native `/v1/messages` protocol using Anthropic request fields and named SSE events.

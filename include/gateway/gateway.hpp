@@ -104,7 +104,7 @@ struct GatewayConfig
     std::string listen_address = "127.0.0.1";
     /* Gateway HTTP 监听端口。 */
     std::uint16_t listen_port = 8080;
-    /* Gateway 专用 MariaDB 连接信息，与 legacy 聊天库隔离。 */
+    /* Gateway 专用 MariaDB 连接信息。 */
     DatabaseConfig database;
     /* HMAC API Key 和 Redis affinity 摘要共用的高熵 pepper，不可记录。 */
     std::string api_key_hmac_pepper;

@@ -11,7 +11,7 @@
 /*
  * 最小 MariaDB Connector/C 封装。
  *
- * 本文件故意不复用 legacy 聊天项目的 MySQL wrapper：Gateway 运行时的 DML/查询必须走 prepared statement，
+ * Gateway 运行时的 DML/查询必须走 prepared statement，
  * 不能打印完整 SQL 或参数。MySqlConnection 负责一条连接的惰性重连、UTF-8/UTC session 和 RAII 资源释放；
  * ConnectionPool/Repository 决定并发和业务事务。静态 SQL 入口仅用于受源码控制的 migration/事务控制语句。
  */
