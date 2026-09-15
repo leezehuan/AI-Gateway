@@ -6,5 +6,8 @@ build/*
 /ai-api-gateway-migration-spec.md
 /docs/legacy-baseline.md
 /plan/
+/docs/
+/chinese_pseudocode/
+/concise_chinese_pseudocode/
 __pycache__/
 *.pyc
