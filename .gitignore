@@ -11,3 +11,35 @@ build/*
 /concise_chinese_pseudocode/
 __pycache__/
 *.pyc
+
+# Python test caches
+.pytest_cache/
+
+# CMake-generated files outside the standard build directory
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Editor-generated files
+.vscode/*.log
+*.swp
+*.swo
+*~
+
+# Local environment variants (keep shareable examples)
+.env.*
+!.env.example
+
+# Runtime uploads and temporary data
+/uploads/*
+!/uploads/.gitkeep
+
+# Independent local repository
+/Aether/
+
+# Locally built standalone JSON example
+/test/testjson/testjson
