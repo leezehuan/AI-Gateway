@@ -33,7 +33,7 @@ namespace
  * 通俗说：健康探测运行在自己的后台线程，但 Runtime、Governance 等模块通过异步回调返回结果。
  * 这个小循环每 50ms 检查一次结果和停机标志，避免析构时无限阻塞。
  *
- * 专业说法：把 callback API 临时桥接为 future 等待；仅供专用探测线程使用，不能放进 Beast I/O 线程。
+ * 专业说法：把 callback API 临时桥接为 future 等待；仅供专用探测线程使用，不能放进 Drogon I/O 线程。
  *
  * 返回值：任务完成时得到值；停机时返回空值。
  */

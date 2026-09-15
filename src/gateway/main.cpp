@@ -16,7 +16,7 @@
  * 函数名直译：主函数。
  *
  * 通俗说：这是 AiGateway 进程的装配入口。它读取环境配置，把数据库、Redis、curl、治理、路由、
- * 健康探测和 HTTP 服务按依赖顺序连接起来，然后进入 Beast 事件循环。
+ * 健康探测和 HTTP 服务按依赖顺序连接起来，然后进入 Drogon 事件循环。
  *
  * 专业说法：main 是 composition root，不承载 HTTP 业务逻辑。对象声明顺序也决定销毁逆序，
  * 因此 HttpServer 先停止接入，随后 Gateway 相关运行时析构，最后 curl transport 关闭 worker。

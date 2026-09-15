@@ -44,15 +44,46 @@ sudo apt-get install -y \
     build-essential \
     cmake \
     git \
-    libboost-all-dev \
+    libjsoncpp-dev \
     libcurl4-openssl-dev \
     libhiredis-dev \
     libmariadb-dev \
     libssl-dev \
+    uuid-dev \
+    zlib1g-dev \
     mariadb-client \
     mariadb-server \
     python3 \
     redis-server
+
+DROGON_VERSION=""
+for version_header in /usr/local/include/drogon/version.h /usr/include/drogon/version.h; do
+    if [[ -f "${version_header}" ]]; then
+        DROGON_VERSION="$(sed -n 's/^#define DROGON_VERSION "\([^"]*\)"/\1/p' "${version_header}")"
+        [[ -n "${DROGON_VERSION}" ]] && break
+    fi
+done
+
+if [[ -z "${DROGON_VERSION}" ]] || ! dpkg --compare-versions "${DROGON_VERSION}" ge 1.9; then
+    DROGON_SOURCE_DIR="$(mktemp -d)"
+    trap 'rm -rf "${DROGON_SOURCE_DIR}"' EXIT
+    git clone --branch v1.9.11 --depth 1 --recurse-submodules --shallow-submodules \
+        https://github.com/drogonframework/drogon.git "${DROGON_SOURCE_DIR}/src"
+    cmake -S "${DROGON_SOURCE_DIR}/src" -B "${DROGON_SOURCE_DIR}/build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_BROTLI=OFF \
+        -DBUILD_CTL=OFF \
+        -DBUILD_DOC=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_ORM=OFF \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_YAML_CONFIG=OFF
+    cmake --build "${DROGON_SOURCE_DIR}/build" --parallel
+    sudo cmake --install "${DROGON_SOURCE_DIR}/build"
+    sudo ldconfig
+    rm -rf "${DROGON_SOURCE_DIR}"
+    trap - EXIT
+fi
 
 if [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]]; then
     sudo systemctl enable --now mariadb redis-server

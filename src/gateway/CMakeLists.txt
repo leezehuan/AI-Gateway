@@ -63,10 +63,11 @@ add_executable(AiGateway
 )
 
 target_include_directories(AiGateway PRIVATE ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(AiGateway PRIVATE ai_gateway_runtime CURL::libcurl Threads::Threads)
-target_compile_definitions(AiGateway PRIVATE
-    BOOST_ASIO_NO_DEPRECATED
-    BOOST_ERROR_CODE_HEADER_ONLY
+target_link_libraries(AiGateway PRIVATE
+    ai_gateway_runtime
+    CURL::libcurl
+    Drogon::Drogon
+    Threads::Threads
 )
 target_compile_options(AiGateway PRIVATE -Wall -Wextra -Wpedantic)
 

@@ -16,7 +16,7 @@
  * Repository 的职责是把“一个用例需要的一致性数据”组织成 prepared-statement 查询或事务，
  * 而不是暴露逐表 CRUD 给 HTTP 层。RuntimeState 调用它来加载认证快照、预留和结算预算、
  * 写入 request_attempts，以及清理崩溃遗留的 started Usage。ConnectionPool 只控制连接复用，
- * 调用 Repository 的线程池由 RuntimeState 控制，两者共同保证 Beast 事件循环不阻塞 SQL。
+ * 调用 Repository 的线程池由 RuntimeState 控制，两者共同保证 Drogon 事件循环不阻塞 SQL。
  */
 namespace ai_gateway
 {

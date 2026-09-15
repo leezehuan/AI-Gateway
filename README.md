@@ -18,7 +18,7 @@ OpenAI Responses / Chat Completions / Anthropic Messages 客户端
 
 ## 构建
 
-构建需要 CMake、C++17 编译器、Boost、libcurl、OpenSSL、MariaDB Connector/C、hiredis、Redis 和 Python 3。
+构建需要 CMake、C++17 编译器、Drogon 1.9 或更高版本、libcurl、OpenSSL、MariaDB Connector/C、hiredis、Redis 和 Python 3。本项目通过 CMake `find_package(Drogon 1.9)` 使用已安装的 Drogon；当前验证版本为 Drogon 1.9.11 和 Trantor 1.5.24。
 
 ```bash
 cp .env.example .env

@@ -184,7 +184,7 @@ struct HealthCheckResult
 /*
  * RuntimeState：数据库访问、HMAC 鉴权、Auth Snapshot 缓存和配置版本轮询的异步外观。
  *
- * Beast 事件循环只提交回调，不直接执行阻塞 SQL；具体线程池和缓存细节隐藏在 Impl 中。
+ * Drogon 事件循环只提交回调，不直接执行阻塞 SQL；具体线程池和缓存细节隐藏在 Impl 中。
  */
 class RuntimeState
 {

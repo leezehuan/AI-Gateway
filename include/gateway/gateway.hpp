@@ -29,7 +29,7 @@ using HeaderMap = std::unordered_map<std::string, std::string>;
 /*
  * 一次入站 HTTP 请求的最小内部表示。
  *
- * Beast/Drogon 适配层只负责把网络对象转换成这个值；后续认证、协议校验和 Provider 调用都不再依赖 Beast 类型。
+ * Drogon/Trantor 适配层只负责把网络对象转换成这个值；后续认证、协议校验和 Provider 调用都不再依赖 Drogon 类型。
  */
 struct GatewayRequest
 {
@@ -100,7 +100,7 @@ public:
 
 struct GatewayConfig
 {
-    /* Beast listener 绑定的本机地址；默认只监听 loopback，公网暴露交给 Nginx。 */
+    /* Drogon listener 绑定的本机地址；默认只监听 loopback，公网暴露交给 Nginx。 */
     std::string listen_address = "127.0.0.1";
     /* Gateway HTTP 监听端口。 */
     std::uint16_t listen_port = 8080;
@@ -138,7 +138,7 @@ struct GatewayConfig
     long stream_idle_timeout_ms = 60000;
     /* 从第一次 Provider Attempt 起计算的流总时长上限，不因 failover 重置。 */
     long stream_max_duration_ms = 900000;
-    /* Beast io_context 的工作线程数。 */
+    /* Drogon/Trantor I/O 工作线程数。 */
     std::size_t io_threads = 2;
     /* 单节点同时处于完整生命周期中的代理请求上限。 */
     std::size_t max_active_requests = 256;

@@ -972,7 +972,7 @@ private:
         }
     }
 
-    /* Beast Writer 降到低水位后恢复 curl transfer，已接收 chunk 不会重放。 */
+    /* Drogon Writer 降到低水位后恢复 curl transfer，已接收 chunk 不会重放。 */
     void resume()
     {
         paused_.store(false);
@@ -2221,10 +2221,10 @@ bool AiGateway::ready() const
  * 异步完成 HMAC/MySQL 鉴权，成功后交给 handle_authorized。这里不执行 Provider 协议细节。
  *
  * 专业说法：这是入站 HTTP 到深模块的总入口，保证鉴权优先于 JSON/model/stream 校验，
- * 并通过回调保持 Beast 事件循环非阻塞。
+ * 并通过回调保持 Drogon 事件循环非阻塞。
  *
  * 参数说明：
- * - request：Drogon/Beast 转换后的方法、路径、Header、request ID 和正文。
+ * - request：Drogon/Trantor 转换后的方法、路径、Header、request ID 和正文。
  * - response：只负责写 HTTP 响应的 ResponseWriter。
  * - cancellation：客户端断开或节点停机的取消令牌。
  */
@@ -2402,7 +2402,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
     if (request.body.size() > config.max_body_bytes)
     {
         const std::string body = error_body(protocol_error(
-            413, "invalid_request_error", "body_too_large", "Request body is too large"));
+            413, "invalid_request_error", "request_too_large", "Request body is too large"));
         write_response(response, 413, request.request_id, body);
         log_completion(request, 413, started, {}, "not_attempted", body.size(), false, 0,
                        tenant_slug, api_key_id);

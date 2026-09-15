@@ -173,7 +173,7 @@ public:
  *
      * 通俗说：发送 PING 确认共享路由运行态可用；失败立即断开，下次操作重新连接。
  *
-     * 专业说法：RoutingRuntime 每秒用它维护 readiness，不会在 Beast I/O 线程中直接执行。
+     * 专业说法：RoutingRuntime 每秒用它维护 readiness，不会在 Drogon I/O 线程中直接执行。
      */
     bool ping()
     {
@@ -468,7 +468,7 @@ public:
     /*
      * 函数名直译：路由运行时构造函数。
  *
-     * 通俗说：启动固定数量 Redis worker。HTTP 请求只把路由任务排队，不会在 Beast 事件循环里等待网络 Redis。
+     * 通俗说：启动固定数量 Redis worker。HTTP 请求只把路由任务排队，不会在 Drogon 事件循环里等待网络 Redis。
  *
      * 专业说法：有界任务队列 + 固定 worker pool 是 RoutingStore 的异步隔离层。
      */
