@@ -16,14 +16,6 @@
 #include <thread>
 #include <utility>
 
-/*
- * 多候选路由的共享 Redis 运行态。
- *
- * AuthSnapshot 给出“静态允许”的 ModelTarget 集合；RoutingRuntime 再从 Redis 读取会话亲和、健康分和
- * 熔断状态，过滤不可用候选并排序。fixed_order 以 priority 为主，load_balance 用 rendezvous hash 稳定分散，
- * cache_affinity 优先复用成功目标。所有节点写入同一份 Redis 状态，所以一个节点观察到连续 5xx 后，
- * 其他节点也会跳过熔断候选；Redis 不可用时不退化到本地内存路由。
- */
 namespace ai_gateway
 {
 namespace
@@ -56,17 +48,6 @@ std::string hex(const unsigned char *bytes, std::size_t size)
     return output.str();
 }
 
-/*
- * 函数名直译：亲和性摘要。
- *
- * 通俗说：把 Key ID、协议、逻辑模型、客户端类别、会话提示和配置版本混合后做 HMAC，
- * 得到一个不能反推出原始会话内容的 Redis key 后缀。
- *
- * 专业说法：使用 Gateway pepper 的 HMAC-SHA256 形成分区亲和键，配置版本参与摘要，
- * 因而管理员更新路由后旧 affinity 不会误命中新配置。
- *
- * 注意：绝不直接把 session、prompt 或完整 API Key 作为 Redis key 保存。
- */
 std::string affinity_digest(const GatewayConfig &config, const RouteRequest &request)
 {
     const std::string input = request.public_api_key_id + "\x1f" + request.protocol + "\x1f" +
@@ -84,14 +65,6 @@ std::string affinity_digest(const GatewayConfig &config, const RouteRequest &req
     return hex(digest, digest_size);
 }
 
-/*
- * 函数名直译：Rendezvous 哈希。
- *
- * 通俗说：同一 seed 对每个候选算一个分数，分数最高者优先。候选增减时大多数请求仍会落在原目标，
- * 比简单取模更适合多节点稳定分流。
- *
- * 专业说法：这是 Highest Random Weight hashing 的一个确定性实现。
- */
 std::uint64_t rendezvous_hash(const std::string &seed, const std::string &candidate)
 {
     const std::string input = seed + "\x1f" + candidate;
@@ -105,7 +78,6 @@ std::uint64_t rendezvous_hash(const std::string &seed, const std::string &candid
     return value;
 }
 
-/* 将连续健康分压缩为三个排序桶，避免极小分数差导致路由频繁抖动。 */
 int health_bucket(int score)
 {
     if (score >= 80)
@@ -150,7 +122,7 @@ long long reply_integer(redisReply *reply, long long fallback)
     }
     return fallback;
 }
-} // namespace
+}
 
 class HiredisRoutingStore::Impl
 {
@@ -168,13 +140,8 @@ public:
         disconnect_locked();
     }
 
-    /*
-     * 函数名直译：Ping Redis。
- *
-     * 通俗说：发送 PING 确认共享路由运行态可用；失败立即断开，下次操作重新连接。
- *
-     * 专业说法：RoutingRuntime 每秒用它维护 readiness，不会在 Beast I/O 线程中直接执行。
-     */
+
+
     bool ping()
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -192,15 +159,8 @@ public:
         return true;
     }
 
-    /*
-     * 函数名直译：读取路由快照。
- *
-     * 通俗说：一次规划路由时，读取会话上次成功的目标，以及所有候选当前健康分和熔断状态。
- * 熔断冷却结束时，只有抢到 NX probe lease 的一个节点可以先尝试恢复目标。
- *
-     * 专业说法：该函数把 affinity GET、候选 HMGET 和 half-open SET NX PX 组合成一个 worker 内的 Redis 读取过程。
- * Redis 任一操作异常即返回 nullopt，让请求 fail closed 而不是退化为节点私有判断。
-     */
+
+
     std::optional<RoutingSnapshot> snapshot(const std::string &affinity_key,
                                             const std::vector<std::string> &fingerprints,
                                             std::int64_t current_ms,
@@ -266,16 +226,8 @@ public:
         return result;
     }
 
-    /*
-     * 函数名直译：记录路由反馈。
- *
-     * 通俗说：一次候选调用完成后，原子更新健康分、连续失败次数、熔断时间，必要时写入或删除会话亲和目标。
- *
-     * 专业说法：Lua 脚本使多个 Gateway 节点对同一候选的“读改写”保持原子；429 的 Retry-After 会延长冷却，
- * 但上限为五分钟。
- *
-     * 注意：只有调用方确认成功终态时才携带 affinity_key，避免失败请求把会话粘到坏目标。
-     */
+
+
     bool record(const std::string &fingerprint,
                 const std::string &affinity_key,
                 bool success,
@@ -348,15 +300,8 @@ private:
                reply->type != REDIS_REPLY_ERROR;
     }
 
-    /*
-     * 函数名直译：确保已连接。
- *
-     * 通俗说：需要 Redis 时复用健康连接；断开时按超时配置重连、认证并选择 DB。
- *
-     * 专业说法：调用者已持有 mutex。失败路径会清理 context，保证下一次可从干净状态重试。
- *
-     * 注意：密码只作为 hiredis 二进制参数传递，绝不记录。
-     */
+
+
     bool ensure_locked()
     {
         if (context_ != nullptr && context_->err == 0)
@@ -465,13 +410,8 @@ bool HiredisRoutingStore::record(const std::string &candidate_fingerprint,
 class RoutingRuntime::Impl
 {
 public:
-    /*
-     * 函数名直译：路由运行时构造函数。
- *
-     * 通俗说：启动固定数量 Redis worker。HTTP 请求只把路由任务排队，不会在 Beast 事件循环里等待网络 Redis。
- *
-     * 专业说法：有界任务队列 + 固定 worker pool 是 RoutingStore 的异步隔离层。
-     */
+
+
     Impl(GatewayConfig config, RoutingStore &store)
         : config_(std::move(config)), store_(store)
     {
@@ -481,7 +421,7 @@ public:
         }
     }
 
-    /* 通知 worker 停止并 join，确保没有回调仍访问已销毁的 Store。 */
+
     ~Impl()
     {
         stopping_.store(true);
@@ -495,15 +435,8 @@ public:
         }
     }
 
-    /*
-     * 函数名直译：规划路由。
- *
-     * 通俗说：从允许的候选中去掉已熔断目标，再按固定优先级、健康桶、会话亲和或稳定负载均衡排序，
- * 最后限制为本请求最多可尝试的数量。
- *
-     * 专业说法：异步读取 RoutingSnapshot 后执行 pure in-memory 排序；cache_affinity 首选 Redis 记录的成功目标，
- * 未命中时退化为 rendezvous hash。回调始终在 Redis worker 线程触发，上层负责切回自己的执行上下文。
-     */
+
+
     void plan(RouteRequest request, PlanCallback callback)
     {
         auto shared_callback = std::make_shared<PlanCallback>(std::move(callback));
@@ -656,13 +589,8 @@ public:
     bool ready() const { return ready_.load(); }
 
 private:
-    /*
-     * 函数名直译：入队任务。
- *
-     * 通俗说：队列已满或正在停机时拒绝新 Redis 工作，调用方据此返回 routing_unavailable。
- *
-     * 专业说法：mutex 保护有界 deque，condition_variable 只唤醒一个空闲 worker。
-     */
+
+
     bool enqueue(std::function<void()> task)
     {
         {
@@ -677,13 +605,8 @@ private:
         return true;
     }
 
-    /*
-     * 函数名直译：工作线程循环。
- *
-     * 通俗说：不断取出一个路由任务执行，并每秒 Ping Redis 更新 ready 状态。
- *
-     * 专业说法：worker 捕获任务异常以避免单个坏回调杀死线程；stopping_ 使析构可以有序退出。
-     */
+
+
     void worker_loop()
     {
         auto next_ping = SteadyClock::now();
@@ -734,16 +657,13 @@ private:
     std::vector<std::thread> workers_;
 };
 
-/* 创建 Gateway 级异步路由模块。 */
 RoutingRuntime::RoutingRuntime(GatewayConfig config, RoutingStore &store)
     : impl_(std::make_unique<Impl>(std::move(config), store))
 {
 }
 
-/* 销毁内部 worker pool。 */
 RoutingRuntime::~RoutingRuntime() = default;
 
-/* 对外提交一次候选排序任务。 */
 void RoutingRuntime::plan(RouteRequest request, PlanCallback callback)
 {
     impl_->plan(std::move(request), std::move(callback));
@@ -761,7 +681,6 @@ void RoutingRuntime::record(std::string candidate_fingerprint,
                   retryable_failure, retry_after_ms, std::move(callback));
 }
 
-/* 健康探测失败按可重试失败计入熔断，但不写会话亲和。 */
 void RoutingRuntime::record_health_probe(std::string candidate_fingerprint,
                                          bool success,
                                          FeedbackCallback callback)
@@ -772,4 +691,4 @@ void RoutingRuntime::record_health_probe(std::string candidate_fingerprint,
 
 /* 返回最近一次 Redis 操作/心跳确认的可用性。 */
 bool RoutingRuntime::ready() const { return impl_->ready(); }
-} // namespace ai_gateway
+}

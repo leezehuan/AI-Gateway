@@ -7,27 +7,17 @@
 #include <utility>
 #include <vector>
 
-/*
- * 单进程共享 libcurl multi Provider transport。
- *
- * 所有 CURL easy/multi 操作只能发生在本文件的 worker 线程。Gateway/HTTP 线程通过 ProviderTransfer 把
- * cancel、resume 和 stream-start 信号放入命令队列，再由 curl_multi_wakeup 唤醒 worker；慢 DNS、TLS、
- * Provider body 或暂停 SSE 因而不会阻塞 /healthz 与其他连接。
- *
- * write callback 只在执行状态机接受当前 chunk 后才允许 pause，恢复时 curl 不会重放已接收字节。完成路径
- * 汇总状态码、时序和错误分类，并严格调用一次 on_complete。
- */
 namespace ai_gateway
 {
 struct CurlMultiProviderTransport::Task
 {
     /* 本次调用不可变的 URL/Header/body/超时快照。 */
     ProviderRequest request;
-    /* 执行状态机提供的头、body、完成三个回调。 */
+
     ProviderCallbacks callbacks;
-    /* multi 完成后交给 on_complete 的聚合结果。 */
+
     ProviderResponse response;
-    /* libcurl 分配的请求头链表与 easy handle，只能由 worker 释放。 */
+
     curl_slist *headers = nullptr;
     CURL *easy = nullptr;
     /* 其他线程只写这些原子意图位；worker 读取后真正调用 curl_easy_pause/remove_handle。 */
@@ -56,7 +46,7 @@ namespace
 class CurlProviderTransfer final : public ProviderTransfer
 {
 public:
-    /* 保存 Task 弱引用和 wake 函数；所有控制命令回到 curl multi worker。 */
+
     CurlProviderTransfer(std::weak_ptr<CurlMultiProviderTransport::Task> task,
                          std::function<void()> wake)
         : task_(std::move(task)), wake_(std::move(wake))
@@ -108,7 +98,6 @@ std::string lower(std::string value)
     return value;
 }
 
-/* 去除响应头的行尾和两端空白。 */
 std::string trim(std::string value)
 {
     while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
@@ -124,14 +113,6 @@ std::string trim(std::string value)
     return value.substr(offset);
 }
 
-/*
- * 函数名直译：交付响应头。
- *
- * 通俗说：HTTP 状态行和所有头可能分多次进入 header callback；直到遇到空行才说明头部完整。
- * 这时只调用一次 on_headers，让流状态机在首个 body chunk 前验证 2xx 和 Content-Type。
- *
- * 注意：3xx/1xx 等中间响应会重新开始头集合；headers_delivered_ 防止同一最终响应重复回调。
- */
 void deliver_headers(CurlMultiProviderTransport::Task &task)
 {
     if (task.headers_delivered || task.response.status < 200)
@@ -152,17 +133,6 @@ void deliver_headers(CurlMultiProviderTransport::Task &task)
     }
 }
 
-/*
- * 函数名直译：写入数据回调。
- *
- * 通俗说：每当网络收到一段 Provider body，curl 在自己的 worker 线程调用这里。函数先检查取消和字节上限，
- * 然后把当前 chunk 交给 Gateway 执行状态机。状态机返回 continue 表示可继续，pause 表示下游写队列太满，
- * cancel 表示客户端断开或协议已失败。
- *
- * 专业说法：返回 bytes 表示“当前 chunk 已经被消费”；返回 CURL_WRITEFUNC_PAUSE 表示 curl 保留内部读取状态，
- * 后续由 curl_easy_pause(...CONT) 恢复。pause 只能发生在 on_body 已接受当前字节之后，因此不会重复转发。
- * 返回 0 会使 curl 终止 transfer，并在统一完成路径归类为 callback/response failure。
- */
 size_t write_callback(char *data, size_t size, size_t count, void *opaque)
 {
     auto *task = static_cast<CurlMultiProviderTransport::Task *>(opaque);
@@ -216,7 +186,6 @@ size_t write_callback(char *data, size_t size, size_t count, void *opaque)
     return bytes;
 }
 
-/* 解析状态行和小写响应头；单个响应头集合超过 64 KiB 时中止 transfer。 */
 size_t header_callback(char *data, size_t size, size_t count, void *opaque)
 {
     auto *task = static_cast<CurlMultiProviderTransport::Task *>(opaque);
@@ -339,10 +308,6 @@ ProviderError classify_result(const CurlMultiProviderTransport::Task &task, CURL
     return ProviderError::none;
 }
 
-/*
- * 完成一个 easy handle：采集 curl timing、移除 handle、释放 Header list，最后只调用一次
- * on_complete。回调异常被吞掉，避免破坏 multi worker。
- */
 void complete_task(CURLM *multi,
                    CURL *easy,
                    const std::shared_ptr<CurlMultiProviderTransport::Task> &task,
@@ -389,9 +354,8 @@ void complete_task(CURLM *multi,
         }
     }
 }
-} // namespace
+}
 
-/* 初始化 libcurl global、多句柄连接上限和单一 multi worker。 */
 CurlMultiProviderTransport::CurlMultiProviderTransport(const GatewayConfig &config)
 {
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -409,7 +373,6 @@ CurlMultiProviderTransport::CurlMultiProviderTransport(const GatewayConfig &conf
     }
 }
 
-/* 先停止 worker，再清理 multi/global curl 资源。 */
 CurlMultiProviderTransport::~CurlMultiProviderTransport()
 {
     shutdown();
@@ -445,13 +408,6 @@ void CurlMultiProviderTransport::shutdown()
     }
 }
 
-/*
- * 提交一次 Provider 请求。
- *
- * 通俗说：只把请求放入共享队列并马上返回控制句柄，绝不为每个请求创建阻塞线程。
- *
- * 专业说法：这是 libcurl multi 的异步外部 seam；实际 easy handle 创建、配置和操作只发生在 run worker。
- */
 std::shared_ptr<ProviderTransfer> CurlMultiProviderTransport::execute(
     ProviderRequest request,
     ProviderCallbacks callbacks)
@@ -479,7 +435,6 @@ std::shared_ptr<ProviderTransfer> CurlMultiProviderTransport::execute(
     return transfer;
 }
 
-/* transport 仍在运行且没有被 shutdown 时为健康。 */
 bool CurlMultiProviderTransport::healthy() const
 {
     return healthy_.load() && !stopping_.load();
@@ -670,4 +625,4 @@ void CurlMultiProviderTransport::run()
         }
     }
 }
-} // namespace ai_gateway
+}

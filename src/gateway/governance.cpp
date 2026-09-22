@@ -13,13 +13,6 @@
 #include <unordered_map>
 #include <utility>
 
-/*
- * 分布式资源治理实现。
- *
- * Redis Lua 脚本原子维护滚动 60 秒 RPM 与并发 lease；MySQL 预算预留和 Usage 终态由 RuntimeState/Repository
- * 负责。本文件只处理 Redis，并把 hiredis 阻塞调用限制在固定 worker。准入成功得到 GovernancePermit：
- * 请求完成后释放并发成员，RPM 记录按时间自然过期；长 SSE 会续租，续租失败必须取消上游而不能依赖本地计数。
- */
 namespace ai_gateway
 {
 namespace
@@ -37,16 +30,6 @@ struct RedisReplyDeleter
 };
 using Reply = std::unique_ptr<redisReply, RedisReplyDeleter>;
 
-/*
- * 函数名直译：以参数数组执行 Redis 命令。
- *
- * 通俗说：把每个 C++ string 的地址和长度分别交给 hiredis，而不是先拼成一整条命令文本。
- * 这样 permit ID、scope 名称等数据即使含空格或二进制字节，也不会被 Redis 命令解析器误拆分。
- *
- * 专业说法：redisCommandArgv 是二进制安全的 hiredis API；Reply unique_ptr 接管返回对象的释放责任。
- *
- * 注意：arguments 在 redisCommandArgv 返回前一直有效，返回后 hiredis 已完成参数复制/发送。
- */
 Reply command_argv(redisContext *context, const std::vector<std::string> &arguments)
 {
     std::vector<const char *> values;
@@ -77,7 +60,7 @@ long long integer_at(redisReply *reply, std::size_t index, long long fallback = 
     }
     return fallback;
 }
-} // namespace
+}
 
 class HiredisGovernanceStore::Impl
 {
@@ -104,23 +87,8 @@ public:
         return valid_locked(reply.get()) && reply->type == REDIS_REPLY_STATUS;
     }
 
-    /*
-     * 函数名直译：预留治理额度。
-     *
-     * 通俗说：一次请求可能同时受 Tenant、API Key、Credential 三层限制。Lua 会先清理过期成员，
-     * 检查所有层是否都有 RPM 和并发余量，只有全部通过才把同一个 permit ID 写入全部集合。
-     * 任一层不足时，它在写入任何新成员前返回，所以不会出现“Tenant 已扣、Key 未扣”的半成功状态。
-     *
-     * 专业说法：Redis 脚本在单线程执行，TIME 由 Redis 服务器提供，避免多 Gateway 节点的本地时钟偏差
-     * 影响滚动窗口。RPM ZSET score 是开始时间；并发 ZSET score 是 lease 到期时间。
-     *
-     * 参数说明：
-     * - permit_id：本次准入的唯一成员 ID，release/renew 必须使用同一个值。
-     * - scopes：要同时检查的分层配额集合。
-     * - lease_ttl_ms：并发成员的过期时间，进程崩溃后由 Redis 自动回收。
-     *
-     * 返回值：admitted、rate_limited、concurrency_limited 或 unavailable，以及可建议客户端等待的时间。
-     */
+
+
     GovernanceStoreResult reserve(const std::string &permit_id,
                                   const std::vector<GovernanceScope> &scopes,
                                   long lease_ttl_ms)
@@ -228,7 +196,7 @@ public:
         return mutate(script, permit_id, scopes, false, lease_ttl_ms);
     }
 
-    /* 用 SET NX PX 竞争跨节点健康探测的单一执行权。 */
+
     std::optional<bool> acquire_probe_lease(const std::string &probe_id,
                                             long lease_ttl_ms)
     {
@@ -251,14 +219,8 @@ public:
     }
 
 private:
-    /*
-     * 函数名直译：变更治理状态。
-     *
-     * 通俗说：rollback、release、renew 都是“给若干 Redis key 执行一段 Lua”的相同模板。
-     * 这里统一选择需要操作的 RPM/lease key、连接 Redis、执行 EVAL 并校验整数结果。
-     *
-     * 注意：Redis 失败返回 false，而不是假装本地操作成功；调用方据此停止 failover 或取消请求。
-     */
+
+
     bool mutate(const std::string &script,
                 const std::string &permit_id,
                 const std::vector<GovernanceScope> &scopes,
@@ -315,14 +277,8 @@ private:
                reply->type != REDIS_REPLY_ERROR;
     }
 
-    /*
-     * 函数名直译：确保 Redis 连接存在。
-     *
-     * 通俗说：现有连接健康就复用；失败则丢弃并按配置建立、认证、选择逻辑 DB。
-     * 连接/认证任何一步失败都会清空 context，让下一次 worker 任务从干净状态重新尝试。
-     *
-     * 注意：调用者必须已经持有 mutex_；密码只传给 hiredis，绝不进入错误字符串或日志。
-     */
+
+
     bool ensure_locked()
     {
         if (context_ != nullptr && context_->err == 0)
@@ -400,7 +356,6 @@ HiredisGovernanceStore::~HiredisGovernanceStore() = default;
 /* 转发 Redis 连通性检查。 */
 bool HiredisGovernanceStore::ping() { return impl_->ping(); }
 
-/* 转发原子请求准入。 */
 GovernanceStoreResult HiredisGovernanceStore::reserve(
     const std::string &id, const std::vector<GovernanceScope> &scopes, long ttl)
 {
@@ -414,21 +369,18 @@ bool HiredisGovernanceStore::rollback(
     return impl_->rollback(id, scopes);
 }
 
-/* 转发请求终态 lease 释放。 */
 bool HiredisGovernanceStore::release(
     const std::string &id, const std::vector<GovernanceScope> &scopes)
 {
     return impl_->release(id, scopes);
 }
 
-/* 转发活跃请求的 lease 续租。 */
 bool HiredisGovernanceStore::renew(
     const std::string &id, const std::vector<GovernanceScope> &scopes, long ttl)
 {
     return impl_->renew(id, scopes, ttl);
 }
 
-/* 转发健康探测的独占 lease 竞争。 */
 std::optional<bool> HiredisGovernanceStore::acquire_probe_lease(
     const std::string &probe_id, long ttl)
 {
@@ -532,13 +484,13 @@ public:
         }
     }
 
-    /* 请求尚未执行时移除 RPM 和 lease，恢复准入前状态。 */
+
     void rollback(std::shared_ptr<const GovernancePermit> permit, CompletionCallback callback)
     {
         complete(std::move(permit), std::move(callback), false);
     }
 
-    /* 公共终态处理：先从续租表移除，再异步调用 release 或 rollback。 */
+
     void complete(std::shared_ptr<const GovernancePermit> permit,
                   CompletionCallback callback,
                   bool keep_rpm)
@@ -625,7 +577,7 @@ private:
         }
     }
 
-    /* 投递非阻塞 PING，结果直接更新 ready_。 */
+
     void enqueue_ping()
     {
         enqueue([this] { ready_.store(store_.ping()); });
@@ -671,13 +623,11 @@ private:
     std::unordered_map<std::string, Active> active_;
 };
 
-/* 创建 GovernanceRuntime 外观。 */
 GovernanceRuntime::GovernanceRuntime(GatewayConfig config, GovernanceStore &store)
     : impl_(std::make_unique<Impl>(std::move(config), store)) {}
-/* Impl 析构会停止 worker/poller。 */
+
 GovernanceRuntime::~GovernanceRuntime() = default;
 
-/* 转交异步请求准入。 */
 void GovernanceRuntime::admit(std::vector<GovernanceScope> scopes,
                               std::function<void()> lease_lost,
                               AdmissionCallback callback)
@@ -685,14 +635,12 @@ void GovernanceRuntime::admit(std::vector<GovernanceScope> scopes,
     impl_->admit(std::move(scopes), std::move(lease_lost), std::move(callback));
 }
 
-/* 转交正常释放。 */
 void GovernanceRuntime::release(
     std::shared_ptr<const GovernancePermit> permit, CompletionCallback callback)
 {
     impl_->release(std::move(permit), std::move(callback));
 }
 
-/* 转交健康探测 lease 获取。 */
 void GovernanceRuntime::acquire_probe_lease(std::string probe_id,
                                             long lease_ttl_ms,
                                             ProbeLeaseCallback callback)
@@ -700,7 +648,6 @@ void GovernanceRuntime::acquire_probe_lease(std::string probe_id,
     impl_->acquire_probe_lease(std::move(probe_id), lease_ttl_ms, std::move(callback));
 }
 
-/* 转交准入补偿。 */
 void GovernanceRuntime::rollback(
     std::shared_ptr<const GovernancePermit> permit, CompletionCallback callback)
 {
@@ -709,4 +656,4 @@ void GovernanceRuntime::rollback(
 
 /* 查询治理 Redis 当前 readiness。 */
 bool GovernanceRuntime::ready() const { return impl_->ready(); }
-} // namespace ai_gateway
+}

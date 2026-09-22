@@ -3,6 +3,7 @@ build/*
 !build/compile.md
 # 本地历史资料不纳入仓库
 /legacy/
+/_local/
 /ai-api-gateway-migration-spec.md
 /docs/legacy-baseline.md
 /plan/

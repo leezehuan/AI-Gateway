@@ -15,28 +15,11 @@
 #include <utility>
 #include <vector>
 
-/*
- * Provider 主动健康探测控制面。
- *
- * 只有管理员显式配置的非计费 GET/HEAD URL 会被探测。后台线程先抢 Redis probe lease，保证多节点每个周期
- * 至多一个节点访问同一目标；随后申请 Credential 配额、通过共享 curl transport 调用、释放 permit，最后把
- * 结果写回 RoutingRuntime 的候选健康状态。探测不创建客户端 Usage 或 request_attempts，也不要求全部
- * Provider 健康才能让 Gateway ready，因为单个 Logical Model 仍可能有其他可路由候选。
- */
 namespace ai_gateway
 {
 namespace
 {
-/*
- * 函数名直译：等待 Future。
- *
- * 通俗说：健康探测运行在自己的后台线程，但 Runtime、Governance 等模块通过异步回调返回结果。
- * 这个小循环每 50ms 检查一次结果和停机标志，避免析构时无限阻塞。
- *
- * 专业说法：把 callback API 临时桥接为 future 等待；仅供专用探测线程使用，不能放进 Beast I/O 线程。
- *
- * 返回值：任务完成时得到值；停机时返回空值。
- */
+
 template <typename T>
 std::optional<T> await(std::future<T> &future, const std::atomic_bool &stopping)
 {
@@ -49,18 +32,13 @@ std::optional<T> await(std::future<T> &future, const std::atomic_bool &stopping)
     }
     return std::nullopt;
 }
-} // namespace
+}
 
 class HealthProbeRuntime::Impl
 {
 public:
-    /*
-     * 函数名直译：健康探测实现构造函数。
- *
-     * 通俗说：保存 Gateway 各深模块，并启动唯一后台探测线程。这个线程不会占用 HTTP 事件循环。
- *
-     * 专业说法：主动健康检查独立于客户端请求，不创建 Usage 或 request_attempts，但会共用路由健康状态和 Credential 配额。
-     */
+
+
     Impl(RuntimeState &runtime,
          RoutingRuntime &routing,
          GovernanceRuntime &governance,
@@ -82,7 +60,7 @@ public:
     }
 
 private:
-    /* 异步从 RuntimeState 加载管理员显式配置的探测目标。 */
+
     std::optional<HealthCheckResult> load_targets()
     {
         auto promise = std::make_shared<std::promise<HealthCheckResult>>();
@@ -139,15 +117,8 @@ private:
         return std::move(result->permit);
     }
 
-    /*
-     * 函数名直译：执行探测。
- *
-     * 通俗说：向管理员配置的非计费 URL 发 GET/HEAD，并等待完成；停机或 Credential lease 丢失时立即取消上游传输。
- *
-     * 专业说法：ProviderTransport 仍由共享 curl multi worker 执行，future 只在本后台线程等待。
- *
-     * 注意：provider_api_key 只放入请求头，不写日志、指标或持久化记录。
-     */
+
+
     std::optional<ProviderResponse> execute_probe(
         const HealthCheckTarget &target,
         const std::shared_ptr<std::atomic_bool> &lease_lost)
@@ -189,7 +160,7 @@ private:
         return result && *result;
     }
 
-    /* 把探测成败写入每个关联 Mapping 的共享路由健康状态。 */
+
     void record(const HealthCheckTarget &target, bool success)
     {
         for (const auto &fingerprint : target.candidate_fingerprints)
@@ -206,14 +177,8 @@ private:
         }
     }
 
-    /*
-     * 函数名直译：探测一个目标。
- *
-     * 通俗说：抢到跨节点 lease 后，先申请 Credential 额度，再调用 Provider，最后释放额度并更新指标与熔断分数。
- * 没抢到 lease 或额度不足均安静跳过，不把它误判为 Provider 故障。
- *
-     * 专业说法：把 probe lease、GovernancePermit、ProviderTransport 与 RoutingRuntime 串成非计费控制面工作流。
-     */
+
+
     void probe(const HealthCheckTarget &target)
     {
         const auto probe_lease = acquire_probe(target);
@@ -241,14 +206,8 @@ private:
         record(target, success);
     }
 
-    /*
-     * 函数名直译：运行探测循环。
- *
-     * 通俗说：每秒刷新一次管理员配置，并按每个目标自己的 interval_ms 判断是否到期。
- *
-     * 专业说法：due map 使用 steady_clock，避免系统时间调整使本地调度提前/滞后；Provider 成败只影响候选健康，
- * 不会单独把整个 Gateway 判为 not ready。
-     */
+
+
     void run()
     {
         std::vector<HealthCheckTarget> targets;
@@ -303,6 +262,5 @@ HealthProbeRuntime::HealthProbeRuntime(RuntimeState &runtime,
 {
 }
 
-/* 销毁 Pimpl，等待后台健康探测停止。 */
 HealthProbeRuntime::~HealthProbeRuntime() = default;
-} // namespace ai_gateway
+}

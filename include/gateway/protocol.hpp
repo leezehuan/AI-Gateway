@@ -78,7 +78,7 @@ public:
     /* 将一个完整 SSE 帧分类，并提取可用 Usage/sequence 信息。 */
     virtual ProtocolEvent classify_event(std::string_view raw,
                                           const std::vector<ModelPrice> &prices) const = 0;
-    /* 校验非流式响应、补充逻辑模型字段并提取 Usage。 */
+
     virtual bool normalize_response(const Json &provider_response,
                                     std::string_view logical_model,
                                     const std::vector<ModelPrice> &prices,
@@ -91,7 +91,7 @@ public:
     virtual std::string terminal_error(long sequence_number,
                                        std::string_view code,
                                        std::string_view message) const = 0;
-    /* 从受控请求元数据提取 cache affinity 提示，不读取完整 Prompt。 */
+
     virtual std::string session_hint(const Json &payload) const = 0;
 };
 
@@ -110,6 +110,6 @@ ProtocolError protocol_error(int status,
                              std::string message,
                              std::string param = {});
 
-} // namespace ai_gateway
+}
 
 #endif

@@ -18,9 +18,9 @@ namespace ai_gateway
 class MetricsRegistry
 {
 public:
-    /* 创建进程内原子指标集合；不连接外部 Prometheus。 */
+
     MetricsRegistry();
-    /* 销毁指标实现；不会影响 Gateway 请求或数据库状态。 */
+
     ~MetricsRegistry();
 
     MetricsRegistry(const MetricsRegistry &) = delete;
@@ -60,13 +60,13 @@ public:
     void stream_finished();
     void set_dependency_readiness(bool mysql_ready, bool redis_ready);
     void set_node_state(const NodeSnapshot &snapshot);
-    /* 输出 Prometheus text exposition。 */
+
     std::string render() const;
 
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-} // namespace ai_gateway
+}
 
 #endif

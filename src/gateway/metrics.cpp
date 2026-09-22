@@ -6,18 +6,11 @@
 #include <sstream>
 #include <tuple>
 
-/*
- * 进程内 Prometheus 指标实现。
- *
- * MetricsRegistry 只累积数值和配置派生的低基数标签，不把 request ID、API Key、URL、Prompt 或响应正文
- * 放入 metric name/label/value。这样 /metrics 可用于容量、错误率、费用和延迟观测，而不会成为敏感数据
- * 泄漏面或因为每个请求都有新标签造成 Prometheus 内存爆炸。
- */
 namespace ai_gateway
 {
 namespace
 {
-/* 转义 Prometheus label 中的反斜杠、引号和换行，防止标签破坏 exposition 格式。 */
+
 std::string escaped(const std::string &value)
 {
     std::string result;
@@ -41,7 +34,6 @@ std::string escaped(const std::string &value)
     return result;
 }
 
-/* 输出一个 name="value" label；first 控制是否写逗号。 */
 void label(std::ostringstream &output, const char *name, const std::string &value, bool first)
 {
     if (!first)
@@ -50,7 +42,7 @@ void label(std::ostringstream &output, const char *name, const std::string &valu
     }
     output << name << "=\"" << escaped(value) << '"';
 }
-} // namespace
+}
 
 class MetricsRegistry::Impl
 {
@@ -79,7 +71,7 @@ public:
         backpressure_pauses_ += pauses;
     }
 
-    /* 更新 Attempt、token、费用和首字节/总耗时指标。 */
+
     void attempt_completed(const std::string &tenant,
                            const std::string &protocol,
                            const std::string &model,
@@ -202,7 +194,7 @@ public:
         return output.str();
     }
 
-    /* 输出所有 target 级指标共用的有限标签集合。 */
+
     static void render_labels(std::ostringstream &output, const TargetKey &key)
     {
         const auto &[tenant, protocol, model, provider, credential] = key;
@@ -213,7 +205,7 @@ public:
         label(output, "credential", credential, false);
     }
 
-    /* 渲染 token/费用等 target counter。 */
+
     static void render_target_counter(
         std::ostringstream &output,
         const char *name,
@@ -228,7 +220,7 @@ public:
         }
     }
 
-    /* 渲染首字节和耗时的 sum/count summary。 */
+
     static void render_target_summary(
         std::ostringstream &output,
         const char *name,
@@ -271,11 +263,9 @@ public:
     bool redis_ready_ = false;
 };
 
-/* 创建空的进程内指标注册表。 */
 MetricsRegistry::MetricsRegistry() : impl_(std::make_unique<Impl>()) {}
 MetricsRegistry::~MetricsRegistry() = default;
 
-/* 转交请求级指标更新。 */
 void MetricsRegistry::request_completed(const std::string &tenant,
                                         const std::string &protocol,
                                         const std::string &model,
@@ -288,7 +278,6 @@ void MetricsRegistry::request_completed(const std::string &tenant,
     impl_->request_completed(tenant, protocol, model, status, error, duration, failovers, pauses);
 }
 
-/* 转交 Attempt 级指标更新。 */
 void MetricsRegistry::attempt_completed(const std::string &tenant,
                                         const std::string &protocol,
                                         const std::string &model,
@@ -304,14 +293,12 @@ void MetricsRegistry::attempt_completed(const std::string &tenant,
                              usage, first_byte, duration);
 }
 
-/* 记录治理拒绝原因，不记录 request ID 或完整 Key。 */
 void MetricsRegistry::governance_rejected(const std::string &reason)
 {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
     ++impl_->governance_rejections_[reason];
 }
 
-/* 记录显式健康探测结果。 */
 void MetricsRegistry::health_probe_completed(const std::string &provider,
                                              const std::string &credential,
                                              bool success)
@@ -320,7 +307,6 @@ void MetricsRegistry::health_probe_completed(const std::string &provider,
     ++impl_->health_probes_[{provider, credential, success}];
 }
 
-/* 增加活动上游连接计数。 */
 void MetricsRegistry::upstream_started()
 {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
@@ -339,7 +325,6 @@ void MetricsRegistry::stream_started()
 {
 }
 
-/* 流结束接口保留给未来独立 stream 指标。 */
 void MetricsRegistry::stream_finished()
 {
 }
@@ -352,13 +337,11 @@ void MetricsRegistry::set_dependency_readiness(bool mysql_ready, bool redis_read
     impl_->redis_ready_ = redis_ready;
 }
 
-/* 更新节点活动请求、活动流、容量上限和 drain 状态快照。 */
 void MetricsRegistry::set_node_state(const NodeSnapshot &snapshot)
 {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
     impl_->node_ = snapshot;
 }
 
-/* 输出当前所有 Prometheus 指标。 */
 std::string MetricsRegistry::render() const { return impl_->render(); }
-} // namespace ai_gateway
+}

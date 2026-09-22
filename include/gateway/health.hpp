@@ -34,6 +34,6 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-} // namespace ai_gateway
+}
 
 #endif

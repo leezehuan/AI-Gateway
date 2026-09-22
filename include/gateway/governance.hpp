@@ -18,11 +18,11 @@ namespace ai_gateway
  */
 struct QuotaPolicy
 {
-    /* quota_policies.id，用于审计绑定关系。 */
+
     std::uint64_t id = 0;
-    /* active/disabled；Runtime 读取后仍会检查状态。 */
+
     std::string status;
-    /* 60 秒滚动窗口内允许的请求/Attempt 数；空值表示无限制。 */
+
     std::optional<std::uint64_t> rpm;
     /* 同时持有的 Redis 并发 lease 数；空值表示无限制。 */
     std::optional<std::uint64_t> concurrency;
@@ -39,9 +39,9 @@ struct GovernanceScope
 {
     /* tenant、api_key 或 credential；决定 Redis key namespace。 */
     std::string kind;
-    /* 对应数据库内部 ID。 */
+
     std::uint64_t id = 0;
-    /* 该作用域的滚动 RPM 限制。 */
+
     std::optional<std::uint64_t> rpm;
     /* 该作用域的并发 lease 限制。 */
     std::optional<std::uint64_t> concurrency;
@@ -67,11 +67,11 @@ struct GovernancePermit
 
 struct GovernanceResult
 {
-    /* admitted 表示所有 scope 都成功；失败状态用于选择 429/503 错误。 */
+
     GovernanceStatus status = GovernanceStatus::unavailable;
     /* Redis 脚本计算出的建议等待时间，客户端可收到有限的 Retry-After。 */
     long retry_after_ms = 0;
-    /* 只有 admitted 时存在；其他状态不可用于 release/renew。 */
+
     std::shared_ptr<const GovernancePermit> permit;
 };
 
@@ -149,7 +149,7 @@ public:
     /* 正常终态释放并发 lease；RPM 记录自然过期。 */
     void release(std::shared_ptr<const GovernancePermit> permit,
                  CompletionCallback callback = {});
-    /* 为跨节点健康探测竞争一个短 TTL 的独占 lease。 */
+
     void acquire_probe_lease(std::string probe_id,
                              long lease_ttl_ms,
                              ProbeLeaseCallback callback);
@@ -160,6 +160,6 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-} // namespace ai_gateway
+}
 
 #endif

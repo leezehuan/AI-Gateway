@@ -18,16 +18,6 @@
 #include <string>
 #include <utility>
 
-/*
- * Boost.Beast 入站 HTTP 适配器。
- *
- * 本文件不决定认证、路由或 Provider 协议，它只把 Beast request 转成 GatewayRequest，让 HttpSession
- * 实现 ResponseWriter，并在普通 Content-Length 响应与 chunked SSE 响应之间选择正确的写法。
- * socket EOF、写失败、SIGTERM 和 drain 会被转换为取消/完成通知。
- *
- * Gateway 调用 ResponseWriter::end 仅表示“不会再写业务字节”。最后一个 async_write 完成或连接断开后
- * 才触发 completion callback，所以 NodeRequestLease 不会在慢客户端仍有积压数据时过早释放容量。
- */
 namespace ai_gateway
 {
 namespace
@@ -37,7 +27,6 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = asio::ip::tcp;
 
-/* 将入站 Header 名称统一为小写，Gateway HeaderMap 采用大小写无关查找。 */
 std::string lower(std::string value)
 {
     for (char &character : value)
@@ -141,7 +130,7 @@ public:
         return writable;
     }
 
-    /* 严格只接受一次 end；异步泵送完队列后才写 chunked last。 */
+
     void end() override
     {
         bool stream = false;
@@ -165,7 +154,7 @@ public:
         }
     }
 
-    /* 返回 socket 是否仍可写。 */
+
     bool client_connected() const override
     {
         return connected_.load();
@@ -197,7 +186,7 @@ public:
     }
 
 private:
-    /* 使用 Beast parser 读取完整请求，并再次设置 body/header 硬上限。 */
+
     void read_request()
     {
         if (!connected_.load())
@@ -214,7 +203,7 @@ private:
                          });
     }
 
-    /* 把 Beast 请求转换成 GatewayRequest；解析错误在进入 Gateway 前直接返回 413/关闭。 */
+
     void on_read(beast::error_code error)
     {
         if (error == http::error::body_limit || error == http::error::header_limit)
@@ -273,7 +262,7 @@ private:
             });
     }
 
-    /* 发送普通 Content-Length 响应；写完后按 Keep-Alive 决定复用或关闭连接。 */
+
     void post_response()
     {
         if (!connected_.load())
@@ -507,7 +496,7 @@ private:
         socket_.close(ignored);
     }
 
-    /* 严格一次通知下游写入完成，保护 NodeRequestLease 不提前释放。 */
+
     void notify_completion()
     {
         std::function<void()> callback;
@@ -534,7 +523,7 @@ private:
                    : http::status::internal_server_error;
     }
 
-    /* 过滤 hop-by-hop 和由 Beast 自己计算的 Header，避免响应 framing 被伪造。 */
+
     template <typename Body>
     static void apply_headers(http::response<Body> &message, const HeaderMap &headers)
     {
@@ -584,14 +573,8 @@ private:
     bool backpressured_ = false;
     bool completion_called_ = false;
 };
-} // namespace
+}
 
-/*
- * 函数名直译：创建 HTTP 服务器。
- *
- * 通俗说：解析监听地址，打开 TCP socket、绑定端口并进入 listen；任何失败都在启动阶段抛出，
- * 不让进程看似运行但实际上无法接收请求。
- */
 HttpServer::HttpServer(const GatewayConfig &config,
                        AiGateway &gateway,
                        NodeLifecycle &lifecycle)
@@ -625,12 +608,6 @@ HttpServer::HttpServer(const GatewayConfig &config,
     }
 }
 
-/*
- * 函数名直译：运行 HTTP 服务器。
- *
- * 通俗说：启动 accept、注册节点空闲回调和终止信号，再用配置数量的 Asio worker 处理会话。
- * 活动请求归零后 listener 和 io_context 才正常停止。
- */
 void HttpServer::run()
 {
     accept();
@@ -656,7 +633,6 @@ void HttpServer::run()
     }
 }
 
-/* 第一次 SIGINT/SIGTERM 进入自然 drain；第二次信号直接强制退出。 */
 void HttpServer::wait_for_signal()
 {
     signals_.async_wait([this](const beast::error_code &error, int) {
@@ -720,7 +696,6 @@ void HttpServer::cancel_remaining()
     });
 }
 
-/* 关闭 listener、timer 和 io_context；forced 路径使用 _Exit 避免悬挂依赖阻塞退出。 */
 void HttpServer::stop(bool forced)
 {
     if (stopping_)
@@ -750,7 +725,6 @@ void HttpServer::stop(bool forced)
     io_.stop();
 }
 
-/* 异步接受连接；listener 仍打开时递归安排下一次 accept。 */
 void HttpServer::accept()
 {
     acceptor_.async_accept([this](beast::error_code error, tcp::socket socket) {
@@ -764,4 +738,4 @@ void HttpServer::accept()
         }
     });
 }
-} // namespace ai_gateway
+}

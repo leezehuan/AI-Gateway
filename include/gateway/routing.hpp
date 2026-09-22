@@ -20,7 +20,6 @@ struct CandidateRoutingState
     bool half_open_probe = false;
 };
 
-/* 路由查询得到的 affinity 目标和每个候选的共享运行态。 */
 struct RoutingSnapshot
 {
     std::optional<std::string> affinity_target;
@@ -112,7 +111,7 @@ public:
     RoutingRuntime(const RoutingRuntime &) = delete;
     RoutingRuntime &operator=(const RoutingRuntime &) = delete;
 
-    /* 异步按调度模式、健康状态和 session affinity 生成候选顺序。 */
+
     void plan(RouteRequest request, PlanCallback callback);
     /* 返回路由 Redis 是否 ready。 */
     void record(std::string candidate_fingerprint,
@@ -130,6 +129,6 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-} // namespace ai_gateway
+}
 
 #endif

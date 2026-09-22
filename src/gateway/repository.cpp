@@ -10,14 +10,6 @@
 #include <stdexcept>
 #include <utility>
 
-/*
- * MySQL GatewayRepository 实现。
- *
- * Repository 的职责是把“一个用例需要的一致性数据”组织成 prepared-statement 查询或事务，
- * 而不是暴露逐表 CRUD 给 HTTP 层。RuntimeState 调用它来加载认证快照、预留和结算预算、
- * 写入 request_attempts，以及清理崩溃遗留的 started Usage。ConnectionPool 只控制连接复用，
- * 调用 Repository 的线程池由 RuntimeState 控制，两者共同保证 Beast 事件循环不阻塞 SQL。
- */
 namespace ai_gateway
 {
 namespace
@@ -29,20 +21,6 @@ class BudgetExceeded final : public std::exception
 {
 };
 
-/*
- * 函数名直译：检查乘法。
- *
- * 通俗说：预算按“每次尝试金额 × 最大尝试次数”预留。这个函数先确认乘法不会整数溢出，
- * 再返回安全结果，避免异常大配置绕过预算判断。
- *
- * 专业说法：使用无符号整数上界进行 checked arithmetic；溢出被转换为 DatabaseError。
- *
- * 参数说明：
- * - value：单次金额。
- * - count：次数。
- *
- * 返回值：乘积；当 count 为零时返回零。
- */
 std::uint64_t checked_multiply(std::uint64_t value, std::size_t count)
 {
     if (count != 0 && value > std::numeric_limits<std::uint64_t>::max() / count)
@@ -55,21 +33,8 @@ std::uint64_t checked_multiply(std::uint64_t value, std::size_t count)
 class ConnectionPool
 {
 public:
-    /*
-     * 函数名直译：连接池构造函数。
-     *
-     * 通俗说：提前创建固定数量的 Gateway 数据库连接，并把它们放入“可领取”队列。
-     * SQL worker 领取连接后独占使用，完成后由 Lease 自动归还。
-     *
-     * 专业说法：这是一个有界、互斥保护的连接池；容量由 database_pool_size 决定，
-     * 不会因为每个 HTTP 请求而创建新的数据库线程或连接。
-     *
-     * 参数说明：
-     * - config：每条连接共用的数据库配置。
-     * - size：池中连接数量。
-     *
-     * 实现方法：创建 size 个 MySqlConnection，同时把裸指针登记到 available_ 队列。
-     */
+
+
     ConnectionPool(DatabaseConfig config, std::size_t size)
     {
         connections_.reserve(size);
@@ -83,7 +48,7 @@ public:
     class Lease
     {
     public:
-        /* 取得连接池中一条连接的 RAII 借用凭证；析构时自动归还。 */
+
         Lease(ConnectionPool &pool, MySqlConnection *connection)
             : pool_(&pool), connection_(connection)
         {
@@ -97,7 +62,7 @@ public:
             other.connection_ = nullptr;
         }
 
-        /* 借用结束后把连接放回池中，并唤醒一个等待的 worker。 */
+
         ~Lease()
         {
             if (pool_ != nullptr)
@@ -114,14 +79,8 @@ public:
         MySqlConnection *connection_;
     };
 
-        /*
-         * 函数名直译：获取连接池租约。
-         *
-         * 通俗说：没有空闲连接时就在条件变量上等待；有连接后取出队首并交给调用者。
-         *
-         * 专业说法：mutex 保护 available_，condition_variable 把数据库并发限制在池容量内，
-         * Lease 的析构负责最终归还。
-         */
+
+
     Lease acquire()
     {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -147,38 +106,17 @@ private:
     std::deque<MySqlConnection *> available_;
 };
 
-/*
- * 函数名直译：解析 ID。
- *
- * 通俗说：把 SQL 返回的数字文本转换成 Gateway 使用的整数主键。
- *
- * 专业说法：集中处理数据库 ID 的字符串到 uint64_t 转换；格式异常会抛出标准转换异常并由上层处理。
- */
 std::uint64_t parse_id(const std::string &value)
 {
     return static_cast<std::uint64_t>(std::stoull(value));
 }
 
-/* 空字符串代表 SQL NULL 时返回空 optional，否则解析为主键。 */
 std::optional<std::uint64_t> parse_optional_id(const std::string &value)
 {
     return value.empty() ? std::optional<std::uint64_t>()
                          : std::optional<std::uint64_t>(parse_id(value));
 }
 
-/*
- * 函数名直译：加载配额策略。
- *
- * 通俗说：根据关联 ID 读取租户、Key 或 Credential 的 RPM、并发和预算限制；没有绑定策略时返回空。
- *
- * 专业说法：这是 Repository 将 quota_policies 行转换为不可变 QuotaPolicy 的小型查询适配器。
- *
- * 参数说明：
- * - connection：当前事务/快照使用的数据库连接。
- * - id：quota_policies 主键文本。
- *
- * 返回值：存在且唯一时返回策略；ID 有关联但行缺失或形状不符时抛出数据库错误。
- */
 std::optional<QuotaPolicy> load_quota(MySqlConnection &connection, const std::string &id)
 {
     if (id.empty())
@@ -204,14 +142,6 @@ std::optional<QuotaPolicy> load_quota(MySqlConnection &connection, const std::st
     return policy;
 }
 
-/*
- * 函数名直译：校验数据库 Schema。
- *
- * 通俗说：每次使用 Gateway 数据库前，先确认迁移已经达到本程序要求的版本；版本不匹配时 fail closed。
- *
- * 专业说法：读取 schema_migrations 的最新版本并与编译期 required_schema_version 比较，
- * 防止新代码在缺列或旧约束的数据库上部分运行。
- */
 void verify_schema(MySqlConnection &connection)
 {
     const auto rows = connection.query_prepared(
@@ -221,24 +151,19 @@ void verify_schema(MySqlConnection &connection)
         throw DatabaseError("Gateway database schema version is incompatible");
     }
 }
-} // namespace
+}
 
 class MySqlGatewayRepository::Impl
 {
 public:
-    /* Repository 实现构造函数：创建固定大小的数据库连接池。 */
+
     explicit Impl(const GatewayConfig &config)
         : pool_(config.database, config.database_pool_size)
     {
     }
 
-    /*
-     * 函数名直译：读取配置版本。
-     *
-     * 通俗说：RuntimeState 用这个数字判断认证缓存和路由快照是否仍然新鲜。
-     *
-     * 专业说法：每次读取都先校验 Schema，再读取 singleton 配置版本；失败直接抛出，调用方进入 not-ready。
-     */
+
+
     std::uint64_t config_version()
     {
         auto connection = pool_.acquire();
@@ -252,25 +177,8 @@ public:
         return parse_id(rows.front().front());
     }
 
-    /*
-     * 函数名直译：加载访问候选。
-     *
-     * 通俗说：用户携带 Key 前缀到达时，在一个数据库一致性快照内把 Key、租户、策略、模型、Mapping、价格和配额全部读出。
-     * 之后 RuntimeState 才会在内存里做 HMAC 比对和 Secret 解析。
-     *
-     * 专业说法：这是认证与路由的 Repository seam。START TRANSACTION WITH CONSISTENT SNAPSHOT
-     * 保证多个关联表来自同一版本视图，避免读到半套配置。
-     *
-     * 参数说明：
-     * - display_prefix：Key 的可展示前缀，仅用于缩小候选范围，不是完整凭据。
-     *
-     * 返回值：可能匹配该前缀的候选记录集合。
-     *
-     * 实现方法：校验 Schema，开启一致性事务，依次读取版本、Key 主记录、协议/Provider/模型授权、
-     * Mapping、价格和配额；成功提交，异常回滚。
-     *
-     * 注意：返回值包含内部 ID 供审计和配额使用，但不应直接写入客户端响应或日志。
-     */
+
+
     std::vector<RepositoryAccessRecord> load(const std::string &display_prefix)
     {
         auto connection = pool_.acquire();
@@ -406,21 +314,8 @@ public:
         }
     }
 
-    /*
-     * 函数名直译：准入请求。
-     *
-     * 通俗说：在真正调用 Provider 前创建 started Usage，并为租户和 API Key 的日/月预算预留最多尝试次数的金额。
-     * 任一预算不足都会回滚整笔事务。
-     *
-     * 专业说法：这是 MySQL 预算预留事务边界，与 Redis RPM/并发准入配合构成 fail-closed 请求准入。
-     *
-     * 参数说明：
-     * - request：请求身份、模型、协议、请求大小、候选上限和配额策略快照。
-     *
-     * 返回值：admitted、budget_exceeded 或数据库不可用时抛出异常。
-     *
-     * 实现方法：插入 usage_records，按 UTC 日/月计算周期，分别锁定并增加预算预留，成功提交。
-     */
+
+
     RequestAdmissionStatus admit_request(const RequestAdmission &request)
     {
         auto connection = pool_.acquire();
@@ -464,22 +359,8 @@ public:
         }
     }
 
-    /*
-     * 函数名直译：完成请求。
-     *
-     * 通俗说：Provider 链路结束后，找到本次 started Usage，结算预算、记录最终候选、耗时、状态和费用。
-     * 重复调用只看到非 started 状态并直接返回，因此不会重复扣费。
-     *
-     * 专业说法：这是请求级幂等 finalization 事务；精确 Usage 优先，缺失 Usage 时使用预留额估算，
-     * 明确不可计费的请求记录为 not_billable。
-     *
-     * 参数说明：
-     * - request：执行状态机汇总的终态、尝试数、候选 ID、Usage 和计费质量。
-     *
-     * 实现方法：锁定 Usage 与 reserved reservations，逐项把 reserved 转为 settled，更新 usage_records，提交事务。
-     *
-     * 注意：事务失败会回滚，后台治理协调器仍可处理过期 started 记录。
-     */
+
+
     void finish_request(const RequestFinish &request)
     {
         auto connection = pool_.acquire();
@@ -595,13 +476,8 @@ public:
         }
     }
 
-    /*
-     * 函数名直译：加载健康检查。
-     *
-     * 通俗说：读取管理员明确配置的非计费 Provider 探测目标，以及它们使用的 Credential 配额和候选映射。
-     *
-     * 专业说法：这是 HealthProbeRuntime 的配置快照查询，不创建 Usage 或 request_attempts。
-     */
+
+
     std::vector<RepositoryHealthCheck> load_health_checks()
     {
         auto connection = pool_.acquire();
@@ -663,15 +539,8 @@ public:
         return checks;
     }
 
-    /*
-     * 函数名直译：协调废弃请求。
-     *
-     * 通俗说：后台发现超过租约时间仍停留在 started 的 Usage 时，释放预算预留并标记 abandoned，
-     * 防止一次崩溃永久占住预算。
-     *
-     * 专业说法：这是基于 UTC lease_expires_at 的恢复性事务；先锁定过期 reservation，再幂等释放，
-     * 最后仅在该 Usage 已无其他 reserved reservation 时更新状态。
-     */
+
+
     void reconcile_abandoned_requests()
     {
         auto connection = pool_.acquire();
@@ -730,14 +599,8 @@ public:
         }
     }
 
-    /*
-     * 函数名直译：开始尝试。
-     *
-     * 通俗说：每次真正准备调用一个 Provider Candidate 前，先写入唯一 attempt_id 的 started 审计行。
-     * 写入失败时上层不会继续发出 Provider 请求。
-     *
-     * 专业说法：request_attempts 是一次调用一次记录的审计 seam，使用 attempt_id 作为幂等身份。
-     */
+
+
     void begin_attempt(const AttemptStart &attempt)
     {
         auto connection = pool_.acquire();
@@ -753,13 +616,8 @@ public:
              std::to_string(attempt.credential_id), attempt.stream ? "1" : "0"});
     }
 
-    /*
-     * 函数名直译：完成尝试。
-     *
-     * 通俗说：把 Provider 返回状态、错误分类、耗时、字节数、首字节时间、Usage 和可能重复计费标志写回 started attempt。
-     *
-     * 专业说法：WHERE completed_at IS NULL 使终态更新幂等，取消、超时和正常完成都汇聚到同一路径。
-     */
+
+
     void finish_attempt(const AttemptFinish &attempt)
     {
         auto connection = pool_.acquire();
@@ -795,23 +653,8 @@ public:
     }
 
 private:
-    /*
-     * 函数名直译：预留一个作用域预算。
-     *
-     * 通俗说：为租户或 API Key 在某个 UTC 日/月周期预留“每次尝试金额 × 最大尝试数”，
-     * 只有余额足够才把 reservation 写入数据库。
-     *
-     * 专业说法：通过 UPDATE 条件中的 settled+reserved<=limit 实现并发事务下的预算闸门，
-     * 随后插入可过期的 budget_reservations 明细。
-     *
-     * 参数说明：
-     * - connection：当前请求准入事务连接。
-     * - usage_id：usage_records 主键。
-     * - scope_type/scope_id：tenant 或 api_key 及其 ID。
-     * - quota：该作用域的配额，可为空。
-     * - max_attempts：本次请求最多候选尝试数。
-     * - day/month：UTC 周期起点。
-     */
+
+
     static void reserve_scope(MySqlConnection &connection,
                               std::uint64_t usage_id,
                               const std::string &scope_type,
@@ -864,22 +707,18 @@ private:
     ConnectionPool pool_;
 };
 
-/* Gateway Repository 构造函数：建立内部连接池，但不执行业务查询。 */
 MySqlGatewayRepository::MySqlGatewayRepository(const GatewayConfig &config)
     : impl_(std::make_unique<Impl>(config))
 {
 }
 
-/* 析构时销毁 Impl 和连接池，连接池再按 RAII 关闭所有 MariaDB 句柄。 */
 MySqlGatewayRepository::~MySqlGatewayRepository() = default;
 
-/* 对外暴露当前数据库配置版本。 */
 std::uint64_t MySqlGatewayRepository::config_version()
 {
     return impl_->config_version();
 }
 
-/* 对外暴露按前缀加载认证与路由候选的 Repository seam。 */
 std::vector<RepositoryAccessRecord> MySqlGatewayRepository::load_access_candidates(
     const std::string &display_prefix)
 {
@@ -915,4 +754,4 @@ void MySqlGatewayRepository::finish_attempt(const AttemptFinish &attempt)
 {
     impl_->finish_attempt(attempt);
 }
-} // namespace ai_gateway
+}

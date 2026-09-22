@@ -21,28 +21,13 @@
 #include <utility>
 #include <vector>
 
-/*
- * AiGateway 的请求编排中心。
- *
- * 建议按以下顺序阅读：AiGateway::handle 处理公开接口并异步取得 AuthSnapshot；
- * handle_authorized 完成协议校验、节点容量和分布式准入；RequestExecution 把路由计划变成
- * 一个或多个 Provider Attempt；BasicExecution/StreamExecution 分别处理完整 JSON 与 SSE，
- * 但都收束到同一套审计、Usage、治理 lease、节点 lease 和脱敏日志路径。
- *
- * 网络线程不会在这里同步等待 MySQL、Redis 或 Provider。异步对象用 shared_ptr 保持本次执行状态，
- * 客户端断开通过 CancellationToken 传播到 curl transfer；ResponseWriter 仍由 HttpSession 所有。
- */
 namespace ai_gateway
 {
 class CancellationState
 {
 public:
-    /*
-     * 函数名直译：取消。
-     *
-     * 通俗说：把取消标志设上，并通知已经订阅的所有异步任务，例如 curl transfer 和
-     * 客户端断开处理。回调只调用一次，单个回调抛异常也不会阻止其他回调。
-     */
+
+
     void cancel()
     {
         std::vector<std::function<void()>> callbacks;
@@ -120,7 +105,6 @@ std::string lower(std::string value)
     return value;
 }
 
-/* 去除认证字段两端空白；避免把多余空格当作 Key 内容。 */
 std::string trim(std::string value)
 {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
@@ -135,12 +119,6 @@ std::string trim(std::string value)
     return value.substr(offset);
 }
 
-/*
- * 函数名直译：提取 Bearer Token。
- *
- * 通俗说：从客户端 Authorization 头中取出 Gateway Key，只有形如 Bearer <非空值> 才接受。
- * Provider Key 不在这里读取，后续由 ModelTarget 提供。
- */
 bool bearer_token(const GatewayRequest &request, std::string &token)
 {
     const auto found = request.headers.find("authorization");
@@ -159,12 +137,6 @@ bool bearer_token(const GatewayRequest &request, std::string &token)
     return !token.empty();
 }
 
-/*
- * 函数名直译：写完整 JSON 响应。
- *
- * 通俗说：普通请求只需要一次 begin、一次 write 和一次 end；这个辅助函数统一补上
- * Content-Type、request ID 和 no-store，避免每个错误分支漏写安全 Header。
- */
 void write_response(ResponseWriter &writer,
                     int status,
                     const std::string &request_id,
@@ -183,14 +155,6 @@ void write_response(ResponseWriter &writer,
     writer.end();
 }
 
-/*
- * 函数名直译：记录请求完成日志。
- *
- * 通俗说：只记录 request ID、状态、耗时、模型、流标志、字节数和失败分类，帮助排障，
- * 但不把 Authorization、Prompt 或完整响应正文写入日志。
- *
- * 专业说法：这是脱敏结构化终态日志 Adapter，所有异步终态最终都汇聚到这里。
- */
 void log_completion(const GatewayRequest &request,
                     int status,
                     std::chrono::steady_clock::time_point started,
@@ -235,14 +199,6 @@ void log_completion(const GatewayRequest &request,
     structured_log("request_completed", fields);
 }
 
-/*
- * 函数名直译：无 Provider Attempt 地结束请求。
- *
- * 通俗说：鉴权后但尚未调用 Provider 就失败时，仍要完成 MySQL Usage 终态、释放 Redis
- * 请求 lease、释放节点 guard 并记录日志，不能只写一个 HTTP 错误就返回。
- *
- * 专业说法：这是准入成功后、Attempt 数为零的统一 finalization 路径。
- */
 void finish_without_attempt(RuntimeState &runtime,
                             GovernanceRuntime &governance,
                             std::shared_ptr<const GovernancePermit> permit,
@@ -319,14 +275,6 @@ struct SseRecord
     UsageAccounting usage;
 };
 
-/*
- * 函数名直译：寻找完整 SSE 帧的结尾。
- *
- * 通俗说：Provider chunk 可能只包含半行或半个 CRLF；这个函数只有看到空行分隔符时才认为
- * 一个事件完整，未完成内容继续留在 decoder 缓冲区。
- *
- * 返回值：完整帧结束位置；没有完整帧返回 npos。
- */
 std::size_t sse_record_end(const std::string &buffer)
 {
     std::size_t cursor = 0;
@@ -342,8 +290,8 @@ std::size_t sse_record_end(const std::string &buffer)
                     buffer[line_end + 1] == '\n'
                 ? 2
                 : 1;
-        // A CR at the end of a body chunk may be the first half of CRLF.
-        // Keep it buffered until the following chunk identifies the delimiter.
+
+
         if (buffer[line_end] == '\r' && line_end + 1 == buffer.size())
         {
             return std::string::npos;
@@ -357,14 +305,6 @@ std::size_t sse_record_end(const std::string &buffer)
     return std::string::npos;
 }
 
-/*
- * 函数名直译：分类 Responses 风格 SSE 帧。
- *
- * 通俗说：这是没有 ProtocolAdapter 时的兼容分类器，读取 event/data、解析 JSON、识别
- * response.completed、error 和 [DONE]，并保留原始 raw 供下游原样转发。
- *
- * 注意：正常三种协议请求都会走 Adapter；这里主要保留协议通用测试和旧 Responses 语义。
- */
 SseRecord classify_sse_record(std::string raw)
 {
     SseRecord result;
@@ -420,7 +360,7 @@ SseRecord classify_sse_record(std::string raw)
         else
         {
             // SSE extension fields are ignored by clients but remain part of
-            // the raw event forwarded downstream.
+
             continue;
         }
     }
@@ -485,12 +425,8 @@ public:
     {
     }
 
-    /*
-     * 函数名直译：推入 Provider chunk。
-     *
-     * 通俗说：追加一段网络字节，尽可能取出所有完整事件；跨 chunk 的半帧仍留在内部，
-     * 所以事件不会因为 curl 分块方式不同而重复或丢失。
-     */
+
+
     std::vector<SseRecord> push(std::string_view bytes)
     {
         buffer_.append(bytes.data(), bytes.size());
@@ -529,7 +465,7 @@ public:
         return trim(buffer_).empty();
     }
 
-    /* 返回预读缓冲区大小，用于响应上限和提交门保护。 */
+
     std::size_t buffered_bytes() const
     {
         return buffer_.size();
@@ -548,7 +484,6 @@ bool is_event_stream(const HeaderMap &headers)
     return found != headers.end() && lower(found->second).find("text/event-stream") == 0;
 }
 
-/* 从共享 Gateway Usage JSON 中读取非负整数 token。 */
 std::optional<std::uint64_t> unsigned_json_value(const json &object, const char *name)
 {
     if (!object.is_object() || !object.contains(name) ||
@@ -575,12 +510,6 @@ std::optional<std::uint64_t> unsigned_json_value(const json &object, const char 
     }
 }
 
-/*
- * 函数名直译：结算 Usage。
- *
- * 通俗说：当一个完整响应同时给出 input/output token 时，找到生效价格并算出 micro-USD；
- * 没有价格仍返回精确 token，但不伪装费用已精确计算。
- */
 UsageAccounting usage_accounting(const json &usage, const std::vector<ModelPrice> &prices)
 {
     UsageAccounting result;
@@ -689,12 +618,8 @@ std::string provider_error_code(ProviderError error)
 class TransferBinding : public std::enable_shared_from_this<TransferBinding>
 {
 public:
-    /*
-     * 函数名直译：绑定 Provider transfer。
-     *
-     * 通俗说：上游请求对象可能在回调注册之后才创建；绑定时补发此前已经请求的取消、恢复
-     * 和“流已开始”状态，避免竞态导致操作丢失。
-     */
+
+
     void attach(std::shared_ptr<ProviderTransfer> transfer)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -739,7 +664,7 @@ public:
         }
     }
 
-    /* 告知 transport 已通过首事件提交门，可以启用流式 idle 计时。 */
+
     void mark_stream_started()
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -784,7 +709,7 @@ public:
         }
     }
 
-    /* 注册请求的 lease_lost 回调；如果丢失已发生，注册后立即补调用。 */
+
     void subscribe(std::function<void()> callback)
     {
         bool lost;
@@ -826,15 +751,8 @@ struct AttemptDecision
 class RequestExecution final : public std::enable_shared_from_this<RequestExecution>
 {
 public:
-    /*
-     * 函数名直译：创建请求执行状态机。
-     *
-     * 通俗说：把一个已鉴权、已路由、已获得请求级治理许可的请求所需对象全部保存起来，
-     * 后续回调只通过这个 shared_ptr 继续推进，不需要在 HTTP Handler 中等待 Provider。
-     *
-     * 专业说法：这是 Responses/Chat/Anthropic 共用的多 Attempt 执行深模块；它持有原始 payload、
-     * 候选计划、审计身份、SSE 解码器、Provider transfer 和 finalization 状态。
-     */
+
+
     RequestExecution(RuntimeState &runtime,
                      RoutingRuntime &routing,
                      GovernanceRuntime &governance,
@@ -890,12 +808,8 @@ public:
     {
     }
 
-    /*
-     * 函数名直译：启动请求执行。
-     *
-     * 通俗说：先注册 drain、治理租约丢失、客户端取消和下游可写回调，最后开始第一个候选。
-     * 这些回调都捕获弱引用，避免异步事件反过来延长已完成请求。
-     */
+
+
     void start()
     {
         const auto weak = weak_from_this();
@@ -972,7 +886,7 @@ private:
         }
     }
 
-    /* Beast Writer 降到低水位后恢复 curl transfer，已接收 chunk 不会重放。 */
+
     void resume()
     {
         paused_.store(false);
@@ -982,14 +896,8 @@ private:
         }
     }
 
-    /*
-     * 函数名直译：启动下一个 Attempt。
-     *
-     * 通俗说：依次取出路由计划中的候选，先检查 Credential 配额，再写入 started 审计，
-     * 只有审计成功才真正调用 Provider；提交后的失败不会进入这里。
-     *
-     * 注意：每个候选最多使用一次，next_candidate_ 单调递增，避免同一请求重复计费。
-     */
+
+
     void start_next_attempt()
     {
         if (finalized_)
@@ -1079,7 +987,7 @@ private:
         begin_current_attempt();
     }
 
-    /* 创建 Attempt ID、重置本次流状态并异步写入 request_attempts.started。 */
+
     void begin_current_attempt()
     {
         ++attempt_number_;
@@ -1276,12 +1184,8 @@ private:
         return decision;
     }
 
-    /*
-     * 处理非流式 Provider 完成回调。
-     *
-     * 通俗说：先检查取消、大小、transport 和 HTTP 状态，再解析 JSON、恢复逻辑模型名，
-     * 最后进入统一 Attempt 审计和路由反馈。
-     */
+
+
     void on_basic_complete(ProviderResponse upstream)
     {
         finish_active_upstream();
@@ -1365,12 +1269,8 @@ private:
                          is_event_stream(stream_headers_);
     }
 
-    /*
-     * 处理一个上游流 chunk。
-     *
-     * 先计入总响应上限，再送入 SSE Decoder；首个合法业务事件前只缓冲不提交，
-     * 提交后原样写入下游。ResponseWriter 返回高水位时暂停当前 transfer。
-     */
+
+
     ProviderChunkAction on_stream_body(std::string_view bytes)
     {
         if (cancellation_.is_cancelled() || client_cancelled_.load() ||
@@ -1454,12 +1354,8 @@ private:
                               : ProviderChunkAction::continue_transfer;
     }
 
-    /*
-     * 处理流结束。
-     *
-     * 若已提交，只有观察到成功终止事件才算成功；断开、超时、半帧和协议错误只写一个
-     * 当前协议 terminal error。若尚未提交，则可按 retryable 规则回到下一个候选。
-     */
+
+
     void on_stream_complete(ProviderResponse upstream)
     {
         finish_active_upstream();
@@ -1895,14 +1791,8 @@ private:
         finalize_log(503, "gateway_shutdown", body.size(), "cancelled");
     }
 
-    /*
-     * 函数名直译：最终结算并记录。
-     *
-     * 通俗说：把请求从“执行中”变成唯一终态，更新 Usage/预算/Attempt 汇总，释放请求级治理
-     * lease，最后写结构化日志并归还 NodeRequestLease。
-     *
-     * 注意：finalized_ 是幂等门；所有异步完成路径都必须经过这里，不能直接释放容量。
-     */
+
+
     void finalize_log(int status,
                       const std::string &provider_result,
                       std::size_t bytes = 0,
@@ -1998,7 +1888,7 @@ private:
         paused_.store(false);
     }
 
-    /* 首个合法业务事件通过后提交 200 text/event-stream 响应，并回放预提交帧。 */
+
     bool commit_stream()
     {
         committed_ = true;
@@ -2138,7 +2028,7 @@ private:
     std::atomic_bool governance_lost_{false};
     std::atomic_bool shutdown_requested_{false};
 };
-} // namespace
+}
 
 /* 创建未取消的 Token；CancellationSource 与异步协作者共享同一 CancellationState。 */
 CancellationToken::CancellationToken()
@@ -2173,7 +2063,6 @@ CancellationSource::CancellationSource()
 {
 }
 
-/* 导出只读 Token 给执行状态机和 transport。 */
 CancellationToken CancellationSource::token() const
 {
     return CancellationToken(state_);
@@ -2188,14 +2077,6 @@ void CancellationSource::cancel() const
     }
 }
 
-/*
- * 函数名直译：构造 AI Gateway。
- *
- * 通俗说：把身份、路由、治理、节点容量、指标和 Provider transport 这些外部模块接进来；
- * Gateway 自己只编排请求生命周期，不创建数据库/Redis连接。
- *
- * 专业说法：这是深模块的依赖注入边界，HTTP Adapter 只调用 handle，内部状态机通过 seam 工作。
- */
 AiGateway::AiGateway(RuntimeState &runtime,
                      RoutingRuntime &routing,
                      GovernanceRuntime &governance,
@@ -2207,27 +2088,12 @@ AiGateway::AiGateway(RuntimeState &runtime,
 {
 }
 
-/* readiness 同时要求依赖可用、curl worker 健康且节点未进入 draining。 */
 bool AiGateway::ready() const
 {
     return lifecycle_.ready() && runtime_.ready() && routing_.ready() && governance_.ready() &&
            transport_.healthy();
 }
 
-/*
- * 函数名直译：处理 Gateway 请求。
- *
- * 通俗说：先处理无需鉴权的 healthz/readyz/metrics；其他请求提取 Gateway Bearer Key，
- * 异步完成 HMAC/MySQL 鉴权，成功后交给 handle_authorized。这里不执行 Provider 协议细节。
- *
- * 专业说法：这是入站 HTTP 到深模块的总入口，保证鉴权优先于 JSON/model/stream 校验，
- * 并通过回调保持 Beast 事件循环非阻塞。
- *
- * 参数说明：
- * - request：Drogon/Beast 转换后的方法、路径、Header、request ID 和正文。
- * - response：只负责写 HTTP 响应的 ResponseWriter。
- * - cancellation：客户端断开或节点停机的取消令牌。
- */
 void AiGateway::handle(const GatewayRequest &request,
                        ResponseWriter &response,
                        CancellationToken cancellation)
@@ -2242,7 +2108,7 @@ void AiGateway::handle(const GatewayRequest &request,
         log_completion(request, 200, started, {}, "not_attempted", body.size());
         return;
     }
-    // readyz 表示当前实例能否接收新的有效代理请求，因此纳入依赖和 draining 状态。
+
     if (request.method == "GET" && request.path == "/readyz")
     {
         const bool is_ready = ready();
@@ -2252,7 +2118,7 @@ void AiGateway::handle(const GatewayRequest &request,
         log_completion(request, is_ready ? 200 : 503, started, {}, "not_attempted", body.size());
         return;
     }
-    // metrics 不鉴权，供内网 Prometheus 读取；Nginx 公网配置会把它屏蔽。
+
     if (request.method == "GET" && request.path == "/metrics")
     {
         metrics_.set_dependency_readiness(runtime_.ready(),
@@ -2328,17 +2194,6 @@ void AiGateway::handle(const GatewayRequest &request,
         });
 }
 
-/*
- * 函数名直译：处理已鉴权请求。
- *
- * 通俗说：这里按顺序检查模型接口、body/content-type/JSON/model/stream，申请节点容量、
- * Redis/MySQL 请求级治理，再生成候选计划并创建 RequestExecution。
- *
- * 专业说法：这是“授权后、Provider Attempt 前”的 admission 编排层；它把协议 Adapter 的
- * 请求上下文与 AuthSnapshot 的模型候选合并，但不参与 SSE 解析。
- *
- * 注意：节点容量在 Redis/MySQL 准入前申请，拒绝时不消耗租户 RPM、不创建 Usage/Attempt。
- */
 void AiGateway::handle_authorized(GatewayRequest request,
                                   ResponseWriter &response,
                                   CancellationToken cancellation,
@@ -2398,7 +2253,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                        tenant_slug, api_key_id);
         return;
     }
-    // body 上限检查放在 JSON parse 前，避免恶意正文先占满解析内存。
+
     if (request.body.size() > config.max_body_bytes)
     {
         const std::string body = error_body(protocol_error(
@@ -2704,7 +2559,6 @@ void AiGateway::handle_authorized(GatewayRequest request,
         });
 }
 
-/* 生成固定前缀的随机 request ID，用于响应 Header、日志和 Attempt 关联。 */
 std::string generate_request_id()
 {
     thread_local std::mt19937_64 generator(std::random_device{}());
@@ -2727,12 +2581,6 @@ std::string openai_error_body(std::string message,
     return json({{"error", std::move(error)}}).dump();
 }
 
-/*
- * 函数名直译：写结构化日志。
- *
- * 通俗说：把字段组成一行 JSON 写到 stdout，便于 journald/日志系统按字段检索；调用者
- * 只应传入已经脱敏的字段，函数本身不接触 Prompt 或 Secret。
- */
 void structured_log(const std::string &event, const HeaderMap &fields)
 {
     json record = {{"event", event}};
@@ -2743,4 +2591,4 @@ void structured_log(const std::string &event, const HeaderMap &fields)
     std::lock_guard<std::mutex> lock(log_mutex);
     std::cout << record.dump() << std::endl;
 }
-} // namespace ai_gateway
+}
