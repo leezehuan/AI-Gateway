@@ -33,10 +33,32 @@ Testing/
 # Local environment variants (keep shareable examples)
 .env.*
 !.env.example
+/deploy/systemd/*.env
+
+# Local-only configuration variants and generated documentation
+/config/*.local.json
+/config/*-local.json
+/AI-Gateway_wiki_*.md
+
+# Agent/editor workspace metadata
+/.agents/
+/.codex/
+/AGENTS.md
+.vscode/.browse.VC.db*
+.vscode/ipch/
 
 # Runtime uploads and temporary data
 /uploads/*
 !/uploads/.gitkeep
+
+# Logs, coverage reports, crash dumps, and local test output
+*.log
+*.gcda
+*.gcno
+*.gcov
+coverage/
+core
+core.*
 
 # Independent local repository
 /Aether/
