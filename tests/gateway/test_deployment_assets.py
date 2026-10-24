@@ -106,13 +106,13 @@ class DeploymentAssetsTest(unittest.TestCase):
         self.assertIn("location = /metrics", self.nginx_config)
         self.assertIn("return 404", self.nginx_config)
 
-    def test_protocol_example_covers_native_phase7_adapters(self):
+    def test_protocol_example_covers_supported_native_adapters(self):
         protocols = {
             endpoint["protocol"]
             for provider in self.protocol_config["providers"]
             for endpoint in provider["endpoints"]
         }
-        self.assertEqual(protocols, {"responses", "chat_completions", "anthropic_messages"})
+        self.assertEqual(protocols, {"responses", "chat_completions"})
         self.assertNotIn("sk-", json.dumps(self.protocol_config))
 
     def test_default_identity_is_gateway_only(self):

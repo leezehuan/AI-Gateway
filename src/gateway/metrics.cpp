@@ -182,15 +182,6 @@ public:
             output << "ai_gateway_governance_rejections_total{reason=\""
                    << escaped(entry.first) << "\"} " << entry.second << '\n';
         }
-        output << "# TYPE ai_gateway_health_probes_total counter\n";
-        for (const auto &entry : health_probes_)
-        {
-            output << "ai_gateway_health_probes_total{provider=\""
-                   << escaped(std::get<0>(entry.first)) << "\",credential=\""
-                   << escaped(std::get<1>(entry.first)) << "\",status=\""
-                   << (std::get<2>(entry.first) ? "success" : "failure")
-                   << "\"} " << entry.second << '\n';
-        }
         return output.str();
     }
 
@@ -252,7 +243,6 @@ public:
     std::map<TargetKey, std::uint64_t> attempt_duration_sum_ms_;
     std::map<TargetKey, std::uint64_t> attempt_duration_count_;
     std::map<std::string, std::uint64_t> governance_rejections_;
-    std::map<std::tuple<std::string, std::string, bool>, std::uint64_t> health_probes_;
     std::uint64_t request_duration_sum_ms_ = 0;
     std::uint64_t request_duration_count_ = 0;
     std::uint64_t failovers_ = 0;
@@ -297,14 +287,6 @@ void MetricsRegistry::governance_rejected(const std::string &reason)
 {
     std::lock_guard<std::mutex> lock(impl_->mutex_);
     ++impl_->governance_rejections_[reason];
-}
-
-void MetricsRegistry::health_probe_completed(const std::string &provider,
-                                             const std::string &credential,
-                                             bool success)
-{
-    std::lock_guard<std::mutex> lock(impl_->mutex_);
-    ++impl_->health_probes_[{provider, credential, success}];
 }
 
 void MetricsRegistry::upstream_started()

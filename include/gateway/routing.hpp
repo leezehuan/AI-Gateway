@@ -12,17 +12,14 @@
 
 namespace ai_gateway
 {
-/* Redis 中保存的单个候选健康分、熔断和 half-open probe 状态。 */
+/* Redis 中保存的单个候选熔断状态。 */
 struct CandidateRoutingState
 {
-    int health_score = 100;
     bool circuit_open = false;
-    bool half_open_probe = false;
 };
 
 struct RoutingSnapshot
 {
-    std::optional<std::string> affinity_target;
     std::unordered_map<std::string, CandidateRoutingState> candidates;
 };
 
@@ -33,12 +30,9 @@ public:
     virtual ~RoutingStore() = default;
     virtual bool ping() = 0;
     virtual std::optional<RoutingSnapshot> snapshot(
-        const std::string &affinity_key,
         const std::vector<std::string> &candidate_fingerprints,
-        std::int64_t now_ms,
-        long probe_lease_ms) = 0;
+        std::int64_t now_ms) = 0;
     virtual bool record(const std::string &candidate_fingerprint,
-                        const std::string &affinity_key,
                         bool success,
                         bool retryable_failure,
                         long retry_after_ms,
@@ -54,12 +48,9 @@ public:
 
     bool ping() override;
     std::optional<RoutingSnapshot> snapshot(
-        const std::string &affinity_key,
         const std::vector<std::string> &candidate_fingerprints,
-        std::int64_t now_ms,
-        long probe_lease_ms) override;
+        std::int64_t now_ms) override;
     bool record(const std::string &candidate_fingerprint,
-                const std::string &affinity_key,
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
@@ -80,8 +71,6 @@ struct RouteRequest
     std::string logical_model;
     std::string scheduling_mode;
     std::size_t max_attempts = 3;
-    std::string client_family;
-    std::string session_hint;
     std::vector<ModelTarget> candidates;
 };
 
@@ -95,7 +84,6 @@ enum class RouteStatus
 struct RoutePlan
 {
     RouteStatus status = RouteStatus::unavailable;
-    std::string affinity_key;
     std::vector<ModelTarget> candidates;
 };
 
@@ -115,14 +103,10 @@ public:
     void plan(RouteRequest request, PlanCallback callback);
     /* 返回路由 Redis 是否 ready。 */
     void record(std::string candidate_fingerprint,
-                std::string affinity_key,
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
                 FeedbackCallback callback);
-    void record_health_probe(std::string candidate_fingerprint,
-                             bool success,
-                             FeedbackCallback callback);
     bool ready() const;
 
 private:

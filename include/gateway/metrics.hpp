@@ -48,10 +48,6 @@ public:
                            std::uint64_t duration_ms);
     /* 累加 RPM、并发、预算或 Credential 配额拒绝。 */
     void governance_rejected(const std::string &reason);
-    /* 记录显式 Provider 健康探测成功/失败，不创建请求 Usage。 */
-    void health_probe_completed(const std::string &provider,
-                                const std::string &credential,
-                                bool success);
     /* 活动 Provider transfer 数，用于区分上游压力与客户端流数量。 */
     void upstream_started();
     void upstream_finished();

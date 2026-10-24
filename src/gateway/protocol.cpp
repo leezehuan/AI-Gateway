@@ -122,8 +122,8 @@ UsageAccounting usage_fragment_from_object(const json &usage)
     return result;
 }
 
-UsageAccounting usage_from_object(const json &usage,
-                                  const std::vector<ModelPrice> &prices)
+UsageAccounting usage_from_object_impl(const json &usage,
+                                       const std::vector<ModelPrice> &prices)
 {
     UsageAccounting result = usage_fragment_from_object(usage);
     if (!result.input_tokens || !result.output_tokens)
@@ -356,7 +356,7 @@ public:
                     if (payload.contains("response") && payload["response"].is_object() &&
                         payload["response"].contains("usage"))
                     {
-                        result.usage = usage_from_object(payload["response"]["usage"], prices);
+                        result.usage = usage_from_object_impl(payload["response"]["usage"], prices);
                     }
                 }
                 else
@@ -365,13 +365,13 @@ public:
                 }
                 if (payload.contains("usage") && payload["usage"].is_object())
                 {
-                    result.usage = usage_from_object(payload["usage"], prices);
+                    result.usage = usage_from_object_impl(payload["usage"], prices);
                 }
                 else if (payload.contains("response") && payload["response"].is_object() &&
                          payload["response"].contains("usage") &&
                          payload["response"]["usage"].is_object())
                 {
-                    result.usage = usage_from_object(payload["response"]["usage"], prices);
+                    result.usage = usage_from_object_impl(payload["response"]["usage"], prices);
                 }
                 return result;
             });
@@ -399,7 +399,7 @@ public:
         }
         if (response.contains("usage"))
         {
-            usage = usage_from_object(response["usage"], prices);
+            usage = usage_from_object_impl(response["usage"], prices);
         }
         client_body = response.dump();
         return true;
@@ -430,216 +430,11 @@ public:
         return "event: error\ndata: " + payload.dump() + "\n\n";
     }
 
-    /* 从 Responses 的 prompt_cache_key 读取安全的会话亲和提示。 */
-    std::string session_hint(const Json &payload) const override
-    {
-        if (payload.contains("prompt_cache_key") && payload["prompt_cache_key"].is_string())
-        {
-            const std::string value = payload["prompt_cache_key"].get<std::string>();
-            return value.size() <= 1024 ? value : std::string();
-        }
-        return {};
-    }
-
 private:
     std::string protocol_;
     std::string path_;
 };
 
-class AnthropicAdapter final : public ProtocolAdapter
-{
-public:
-
-
-    const std::string &protocol() const override { return protocol_; }
-
-
-
-    bool matches(std::string_view method, std::string_view path) const override
-    {
-        return method == "POST" && path == "/v1/messages";
-    }
-
-
-
-    bool validate_request(const Json &payload,
-                          ProtocolRequestContext &context,
-                          ProtocolError &error) const override
-    {
-        if (!payload.is_object() || !payload.contains("model") ||
-            !payload["model"].is_string() || payload["model"].get<std::string>().empty())
-        {
-            error = protocol_error(400, "invalid_request_error", "invalid_model",
-                                    "model must be a non-empty string", "model");
-            return false;
-        }
-        if (!payload.contains("messages") || !payload["messages"].is_array())
-        {
-            error = protocol_error(400, "invalid_request_error", "invalid_messages",
-                                    "messages must be an array", "messages");
-            return false;
-        }
-        bool valid_max_tokens = false;
-        if (payload.contains("max_tokens"))
-        {
-            const auto &max_tokens = payload["max_tokens"];
-            if (max_tokens.is_number_unsigned())
-            {
-                valid_max_tokens = max_tokens.get<std::uint64_t>() > 0;
-            }
-            else if (max_tokens.is_number_integer())
-            {
-                valid_max_tokens = max_tokens.get<std::int64_t>() > 0;
-            }
-        }
-        if (!valid_max_tokens)
-        {
-            error = protocol_error(400, "invalid_request_error", "invalid_max_tokens",
-                                    "max_tokens must be a positive integer", "max_tokens");
-            return false;
-        }
-        if (payload.contains("stream") && !payload["stream"].is_boolean())
-        {
-            error = protocol_error(400, "invalid_request_error", "invalid_stream",
-                                    "stream must be a boolean", "stream");
-            return false;
-        }
-        context.protocol = protocol_;
-        context.model = payload["model"].get<std::string>();
-        context.stream = payload.value("stream", false);
-        return true;
-    }
-
-
-
-    HeaderMap provider_headers(const GatewayRequest &request,
-                               const ModelTarget &target,
-                               bool stream) const override
-    {
-        HeaderMap headers{{"x-api-key", target.provider_api_key},
-                          {"anthropic-version", "2023-06-01"},
-                          {"content-type", "application/json"},
-                          {"accept", stream ? "text/event-stream" : "application/json"},
-                          {"x-request-id", request.request_id}};
-        for (const char *name : {"user-agent", "anthropic-beta", "x-client-request-id"})
-        {
-            const auto found = request.headers.find(name);
-            if (found != request.headers.end())
-            {
-                headers[name] = found->second;
-            }
-        }
-        return headers;
-    }
-
-
-
-    ProtocolEvent classify_event(std::string_view raw,
-                                 const std::vector<ModelPrice> &prices) const override
-    {
-        return classify_generic(raw, prices,
-            [](std::string_view event_name, std::string_view, const json &payload,
-               const std::vector<ModelPrice> &prices) {
-                ProtocolEvent result;
-                result.payload = payload;
-                const std::string type = event_name.empty()
-                                             ? payload.value("type", "")
-                                             : std::string(event_name);
-                if (type == "error" || payload.value("type", "") == "error")
-                {
-                    result.kind = ProtocolEventKind::provider_error;
-                }
-                else if (type == "message_stop")
-                {
-                    result.kind = ProtocolEventKind::success_terminal;
-                    if (payload.contains("usage"))
-                    {
-                        result.usage = usage_from_object(payload["usage"], prices);
-                    }
-                }
-                else
-                {
-                    result.kind = ProtocolEventKind::business;
-                }
-                if (type == "message_start" && payload.contains("message") &&
-                    payload["message"].is_object() &&
-                    payload["message"].contains("usage") &&
-                    payload["message"]["usage"].is_object())
-                {
-                    result.usage = usage_from_object(payload["message"]["usage"], prices);
-                }
-                else if (payload.contains("usage") && payload["usage"].is_object())
-                {
-                    result.usage = usage_from_object(payload["usage"], prices);
-                }
-                return result;
-            });
-    }
-
-
-
-    bool normalize_response(const Json &provider_response,
-                            std::string_view logical_model,
-                            const std::vector<ModelPrice> &prices,
-                            std::string &client_body,
-                            UsageAccounting &usage,
-                            ProtocolError &error) const override
-    {
-        if (!provider_response.is_object())
-        {
-            error = protocol_error(502, "api_error", "upstream_invalid_response",
-                                   "Upstream provider returned invalid JSON");
-            return false;
-        }
-        Json response = provider_response;
-        if (response.contains("model"))
-        {
-            response["model"] = std::string(logical_model);
-        }
-        if (response.contains("usage"))
-        {
-            usage = usage_from_object(response["usage"], prices);
-        }
-        client_body = response.dump();
-        return true;
-    }
-
-
-    std::string error_body(const ProtocolError &error) const override
-    {
-        Json body = {{"type", "error"},
-                     {"error", {{"type", error.code}, {"message", error.message}}}};
-        return body.dump();
-    }
-
-
-
-    std::string terminal_error(long,
-                               std::string_view code,
-                               std::string_view message) const override
-    {
-        Json body = {{"type", "error"},
-                     {"error", {{"type", std::string(code)},
-                                 {"message", std::string(message)}}}};
-        return "event: error\ndata: " + body.dump() + "\n\n";
-    }
-
-
-    std::string session_hint(const Json &payload) const override
-    {
-        if (payload.contains("metadata") && payload["metadata"].is_object() &&
-            payload["metadata"].contains("user_id") &&
-            payload["metadata"]["user_id"].is_string())
-        {
-            const std::string value = payload["metadata"]["user_id"].get<std::string>();
-            return value.size() <= 1024 ? value : std::string();
-        }
-        return {};
-    }
-
-private:
-    const std::string protocol_ = "anthropic_messages";
-};
 
 const OpenAiAdapter &responses_adapter()
 {
@@ -653,11 +448,12 @@ const OpenAiAdapter &chat_adapter()
     return adapter;
 }
 
-const AnthropicAdapter &anthropic_adapter()
-{
-    static const AnthropicAdapter adapter;
-    return adapter;
 }
+
+UsageAccounting usage_from_object(const Json &usage,
+                                  const std::vector<ModelPrice> &prices)
+{
+    return usage_from_object_impl(usage, prices);
 }
 
 ProtocolError protocol_error(int status,
@@ -672,8 +468,7 @@ ProtocolError protocol_error(int status,
 const ProtocolAdapter *find_protocol_adapter(std::string_view method,
                                              std::string_view path)
 {
-    const ProtocolAdapter *adapters[] = {&responses_adapter(), &chat_adapter(),
-                                         &anthropic_adapter()};
+    const ProtocolAdapter *adapters[] = {&responses_adapter(), &chat_adapter()};
     for (const ProtocolAdapter *adapter : adapters)
     {
         if (adapter->matches(method, path))
@@ -688,7 +483,6 @@ const ProtocolAdapter *find_protocol_adapter_for_name(std::string_view protocol)
 {
     if (protocol == "responses") return &responses_adapter();
     if (protocol == "chat_completions") return &chat_adapter();
-    if (protocol == "anthropic_messages") return &anthropic_adapter();
     return nullptr;
 }
 

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <coroutine>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -95,6 +96,72 @@ namespace
 using json = nlohmann::json;
 
 std::mutex log_mutex;
+
+/* 仅负责请求编排的 detached coroutine；底层 worker 和流式回调保持原接口。 */
+class DetachedTask
+{
+public:
+    struct promise_type
+    {
+        DetachedTask get_return_object() noexcept { return {}; }
+        std::suspend_never initial_suspend() const noexcept { return {}; }
+        std::suspend_never final_suspend() const noexcept { return {}; }
+        void return_void() const noexcept {}
+        void unhandled_exception() const noexcept { std::terminate(); }
+    };
+};
+
+template <typename Value, typename Starter>
+class CallbackAwaiter
+{
+public:
+    explicit CallbackAwaiter(Starter starter)
+        : starter_(std::move(starter))
+    {
+    }
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> continuation)
+    {
+        starter_([continuation, state = state_](Value value) mutable {
+            state->value.emplace(std::move(value));
+            continuation.resume();
+        });
+    }
+
+    Value await_resume() { return std::move(*state_->value); }
+
+private:
+    struct State
+    {
+        std::optional<Value> value;
+    };
+
+    Starter starter_;
+    std::shared_ptr<State> state_ = std::make_shared<State>();
+};
+
+template <typename Value, typename Starter>
+CallbackAwaiter<Value, std::decay_t<Starter>> callback_await(Starter &&starter)
+{
+    return CallbackAwaiter<Value, std::decay_t<Starter>>(
+        std::forward<Starter>(starter));
+}
+
+DetachedTask authenticate_with_coroutine(
+    RuntimeState &runtime,
+    std::string token,
+    std::function<void(AuthResult)> continuation)
+{
+    auto auth_starter = [&runtime, token = std::move(token)]
+        (std::function<void(AuthResult)> callback) mutable {
+            runtime.authenticate(std::move(token), std::move(callback));
+        };
+    auto auth_awaiter = callback_await<AuthResult>(std::move(auth_starter));
+    AuthResult result = co_await std::move(auth_awaiter);
+    continuation(std::move(result));
+}
 
 /* 将 HTTP Header 名称/值规范化为小写，便于大小写无关比较。 */
 std::string lower(std::string value)
@@ -484,94 +551,6 @@ bool is_event_stream(const HeaderMap &headers)
     return found != headers.end() && lower(found->second).find("text/event-stream") == 0;
 }
 
-std::optional<std::uint64_t> unsigned_json_value(const json &object, const char *name)
-{
-    if (!object.is_object() || !object.contains(name) ||
-        !(object[name].is_number_unsigned() || object[name].is_number_integer()))
-    {
-        return std::nullopt;
-    }
-    try
-    {
-        const auto value = object[name].get<std::int64_t>();
-        return value < 0 ? std::nullopt
-                         : std::optional<std::uint64_t>(static_cast<std::uint64_t>(value));
-    }
-    catch (const json::exception &)
-    {
-        try
-        {
-            return object[name].get<std::uint64_t>();
-        }
-        catch (const json::exception &)
-        {
-            return std::nullopt;
-        }
-    }
-}
-
-UsageAccounting usage_accounting(const json &usage, const std::vector<ModelPrice> &prices)
-{
-    UsageAccounting result;
-    const auto input = unsigned_json_value(usage, "input_tokens");
-    const auto output = unsigned_json_value(usage, "output_tokens");
-    if (!input || !output)
-    {
-        return result;
-    }
-    std::uint64_t cached = 0;
-    if (usage.contains("input_tokens_details"))
-    {
-        const auto parsed = unsigned_json_value(usage["input_tokens_details"],
-                                                "cached_tokens");
-        if (!parsed || *parsed > *input)
-        {
-            return result;
-        }
-        cached = *parsed;
-    }
-    result.input_tokens = *input;
-    result.cached_input_tokens = cached;
-    result.output_tokens = *output;
-    result.usage_quality = "exact";
-
-    const auto now = static_cast<std::int64_t>(std::chrono::system_clock::to_time_t(
-        std::chrono::system_clock::now()));
-    const ModelPrice *selected = nullptr;
-    for (const auto &price : prices)
-    {
-        if (price.effective_at_epoch <= now &&
-            (selected == nullptr || price.effective_at_epoch > selected->effective_at_epoch ||
-             (price.effective_at_epoch == selected->effective_at_epoch &&
-              price.id > selected->id)))
-        {
-            selected = &price;
-        }
-    }
-    if (selected == nullptr)
-    {
-        return result;
-    }
-
-    __extension__ typedef unsigned __int128 Wide;
-    const Wide uncached_cost = static_cast<Wide>(*input - cached) *
-                               selected->input_per_million_microusd;
-    const Wide cached_cost = static_cast<Wide>(cached) *
-                             selected->cached_input_per_million_microusd;
-    const Wide output_cost = static_cast<Wide>(*output) *
-                             selected->output_per_million_microusd;
-    const Wide total = uncached_cost + cached_cost + output_cost;
-    const Wide rounded = (total + 999999U) / 1000000U;
-    if (rounded > std::numeric_limits<std::uint64_t>::max())
-    {
-        return result;
-    }
-    result.model_price_id = selected->id;
-    result.cost_microusd = static_cast<std::uint64_t>(rounded);
-    result.cost_quality = "exact";
-    return result;
-}
-
 /* 从 Provider 响应头提取有限长度的公开 request id，供 Attempt 审计使用。 */
 std::string provider_request_id(const HeaderMap &headers)
 {
@@ -765,7 +744,6 @@ public:
                      const ProtocolAdapter &adapter,
                      json payload,
                      std::vector<ModelTarget> candidates,
-                     std::string affinity_key,
                      std::string logical_model,
                      std::string tenant_slug,
                      std::string public_api_key_id,
@@ -791,7 +769,6 @@ public:
           config_(std::move(config)),
           payload_(std::move(payload)),
           candidates_(std::move(candidates)),
-          affinity_key_(std::move(affinity_key)),
           logical_model_(std::move(logical_model)),
           tenant_slug_(std::move(tenant_slug)),
           public_api_key_id_(std::move(public_api_key_id)),
@@ -1364,6 +1341,19 @@ private:
             return;
         }
         AttemptDecision decision;
+        // Drain cancellation must win over transport classification so a pre-commit
+        // stream returns the gateway shutdown contract instead of a generic 502.
+        if (shutdown_requested_.load() || upstream.error == ProviderError::shutdown)
+        {
+            decision.state = "failed";
+            decision.error_class = "gateway_shutdown";
+            decision.retryable = false;
+            decision.possible_duplicate_cost = false;
+            decision.upstream_bytes = attempt_upstream_bytes_;
+            apply_transport_metadata(decision, upstream);
+            finish_attempt(std::move(decision));
+            return;
+        }
         if (cancellation_.is_cancelled() || client_cancelled_.load() ||
             !response_.client_connected())
         {
@@ -1599,7 +1589,7 @@ private:
         }
 
         const bool success = decision.success;
-        routing_.record(current_target_.fingerprint, affinity_key_, success,
+        routing_.record(current_target_.fingerprint, success,
                         decision.retryable, decision.retry_after_ms,
             [self = shared_from_this(), decision = std::move(decision)](bool recorded) mutable {
                 self->on_routing_feedback(std::move(decision), recorded);
@@ -1607,7 +1597,7 @@ private:
     }
 
     /*
-     * 处理 Redis 健康/affinity 反馈。
+     * 处理 Redis 熔断反馈。
      * 未提交且 retryable 时启动下一个候选；已提交时只结束当前响应，绝不 failover。
      */
     void on_routing_feedback(AttemptDecision decision, bool recorded)
@@ -1937,7 +1927,7 @@ private:
                           {"output_tokens", *stream_usage_.output_tokens},
                           {"input_tokens_details",
                            {{"cached_tokens", stream_usage_.cached_input_tokens.value_or(0)}}}};
-            stream_usage_ = usage_accounting(usage, current_target_.prices);
+            stream_usage_ = usage_from_object(usage, current_target_.prices);
         }
         else if (stream_usage_.input_tokens || stream_usage_.output_tokens)
         {
@@ -1973,7 +1963,6 @@ private:
     GatewayConfig config_;
     json payload_;
     std::vector<ModelTarget> candidates_;
-    std::string affinity_key_;
     std::string logical_model_;
     std::string tenant_slug_;
     std::string public_api_key_id_;
@@ -2028,6 +2017,165 @@ private:
     std::atomic_bool governance_lost_{false};
     std::atomic_bool shutdown_requested_{false};
 };
+
+DetachedTask run_authorized_pipeline(
+    RuntimeState &runtime,
+    RoutingRuntime &routing,
+    GovernanceRuntime &governance,
+    MetricsRegistry &metrics,
+    ProviderTransport &transport,
+    const GatewayConfig &config,
+    GatewayRequest request,
+    ResponseWriter &response,
+    CancellationToken cancellation,
+    std::string logical_model,
+    std::string tenant_slug,
+    std::string api_key_id,
+    std::chrono::steady_clock::time_point started,
+    bool stream,
+    std::uint64_t tenant_database_id,
+    std::uint64_t api_key_database_id,
+    std::uint64_t model_database_id,
+    std::size_t max_attempts,
+    std::vector<GovernanceScope> governance_scopes,
+    RequestAdmission request_admission,
+    RouteRequest route_request,
+    nlohmann::json payload,
+    std::shared_ptr<LeaseLossSignal> lease_loss,
+    std::shared_ptr<NodeRequestLease> node_lease,
+    std::shared_ptr<NodeExecutionGuard> node_guard,
+    const ProtocolAdapter *adapter)
+{
+    auto governance_starter =
+        [&governance, governance_scopes = std::move(governance_scopes), lease_loss]
+        (std::function<void(GovernanceResult)> callback) mutable {
+            governance.admit(std::move(governance_scopes),
+                             [lease_loss] { lease_loss->trigger(); },
+                             std::move(callback));
+        };
+    auto governance_awaiter = callback_await<GovernanceResult>(std::move(governance_starter));
+    GovernanceResult admission = co_await std::move(governance_awaiter);
+    if (cancellation.is_cancelled() || !response.client_connected())
+    {
+        governance.release(admission.permit);
+        response.end();
+        log_completion(request, 499, started, logical_model, "client_cancelled", 0,
+                       stream, 0, tenant_slug, api_key_id);
+        co_return;
+    }
+    if (admission.status != GovernanceStatus::admitted || !admission.permit)
+    {
+        int status = 503;
+        std::string code = "governance_unavailable";
+        std::string type = "server_error";
+        std::string message = "Gateway governance is unavailable";
+        if (admission.status == GovernanceStatus::rate_limited)
+        {
+            status = 429;
+            code = "rate_limit_exceeded";
+            type = "rate_limit_error";
+            message = "Request rate limit exceeded";
+        }
+        else if (admission.status == GovernanceStatus::concurrency_limited)
+        {
+            status = 429;
+            code = "concurrency_limit_exceeded";
+            type = "rate_limit_error";
+            message = "Concurrent request limit exceeded";
+        }
+        metrics.governance_rejected(code);
+        const std::string body = adapter->error_body(protocol_error(status, type, code, message));
+        HeaderMap headers;
+        if (admission.retry_after_ms > 0)
+        {
+            headers["retry-after"] = std::to_string(
+                std::max<long>(1, (admission.retry_after_ms + 999) / 1000));
+        }
+        write_response(response, status, request.request_id, body, std::move(headers));
+        log_completion(request, status, started, logical_model, code, body.size(), stream, 0,
+                       tenant_slug, api_key_id);
+        co_return;
+    }
+
+    const auto permit = admission.permit;
+    auto request_starter = [&runtime, request_admission = std::move(request_admission)]
+        (std::function<void(RequestAdmissionStatus)> callback) mutable {
+            runtime.admit_request(std::move(request_admission), std::move(callback));
+        };
+    auto request_awaiter = callback_await<RequestAdmissionStatus>(std::move(request_starter));
+    const RequestAdmissionStatus request_status = co_await std::move(request_awaiter);
+    if (request_status != RequestAdmissionStatus::admitted)
+    {
+        const bool budget = request_status == RequestAdmissionStatus::budget_exceeded;
+        metrics.governance_rejected(budget ? "budget_exceeded" : "governance_unavailable");
+        auto rollback_starter = [&governance, permit](std::function<void(bool)> callback) mutable {
+                governance.rollback(permit, std::move(callback));
+            };
+        auto rollback_awaiter = callback_await<bool>(std::move(rollback_starter));
+        const bool rolled_back = co_await std::move(rollback_awaiter);
+        const bool budget_error = budget && rolled_back;
+        const int status = budget_error ? 429 : 503;
+        const std::string code = budget_error ? "budget_exceeded" : "governance_unavailable";
+        const std::string body = adapter->error_body(protocol_error(
+            status, budget_error ? "insufficient_quota" : "server_error", code,
+            budget_error ? "Request budget is exhausted" : "Gateway governance is unavailable"));
+        write_response(response, status, request.request_id, body);
+        log_completion(request, status, started, logical_model, code, body.size(), stream, 0,
+                       tenant_slug, api_key_id);
+        co_return;
+    }
+    if (cancellation.is_cancelled() || !response.client_connected())
+    {
+        response.end();
+        finish_without_attempt(runtime, governance, permit, std::move(request), 499, started,
+                               logical_model, "client_cancelled", 0, stream, tenant_slug,
+                               api_key_id, max_attempts, node_guard);
+        co_return;
+    }
+
+    auto route_starter = [&routing, route_request = std::move(route_request)]
+        (std::function<void(RoutePlan)> callback) mutable {
+            routing.plan(std::move(route_request), std::move(callback));
+        };
+    auto route_awaiter = callback_await<RoutePlan>(std::move(route_starter));
+    RoutePlan plan = co_await std::move(route_awaiter);
+    if (cancellation.is_cancelled() || !response.client_connected())
+    {
+        response.end();
+        finish_without_attempt(runtime, governance, permit, std::move(request), 499, started,
+                               logical_model, "client_cancelled", 0, stream, tenant_slug,
+                               api_key_id, max_attempts, node_guard);
+        co_return;
+    }
+    if (plan.status == RouteStatus::unavailable)
+    {
+        const std::string body = adapter->error_body(protocol_error(
+            503, "server_error", "routing_unavailable", "Gateway routing is unavailable"));
+        write_response(response, 503, request.request_id, body);
+        finish_without_attempt(runtime, governance, permit, std::move(request), 503, started,
+                               logical_model, "routing_unavailable", body.size(), stream,
+                               tenant_slug, api_key_id, max_attempts, node_guard);
+        co_return;
+    }
+    if (plan.status != RouteStatus::ready || plan.candidates.empty())
+    {
+        const std::string body = adapter->error_body(protocol_error(
+            503, "server_error", "model_unavailable", "Model is temporarily unavailable", "model"));
+        write_response(response, 503, request.request_id, body);
+        finish_without_attempt(runtime, governance, permit, std::move(request), 503, started,
+                               logical_model, "no_candidate", body.size(), stream, tenant_slug,
+                               api_key_id, max_attempts, node_guard);
+        co_return;
+    }
+
+    auto execution = std::make_shared<RequestExecution>(
+        runtime, routing, governance, metrics, transport, std::move(request), response,
+        cancellation, config, *adapter, std::move(payload), std::move(plan.candidates),
+        logical_model, tenant_slug, api_key_id, tenant_database_id, api_key_database_id,
+        model_database_id, max_attempts, permit, lease_loss, node_lease, node_guard, stream,
+        started);
+    execution->start();
+}
 }
 
 /* 创建未取消的 Token；CancellationSource 与异步协作者共享同一 CancellationState。 */
@@ -2152,9 +2300,9 @@ void AiGateway::handle(const GatewayRequest &request,
         return;
     }
 
-    // 鉴权和快照加载异步执行，当前线程只注册完成回调。
-    runtime_.authenticate(
-        std::move(token),
+    // 鉴权和快照加载通过 coroutine 顺序等待；Runtime 仍由有界 worker 执行 SQL。
+    authenticate_with_coroutine(
+        runtime_, std::move(token),
         [this, request, &response, cancellation, started, request_adapter,
          auth_error_body](AuthResult result) mutable {
             if (cancellation.is_cancelled() || !response.client_connected())
@@ -2340,32 +2488,6 @@ void AiGateway::handle_authorized(GatewayRequest request,
     auto node_lease = std::move(node_admission.lease);
     auto node_guard = node_lease->execution_guard();
     response.set_completion_callback([node_lease] { node_lease->response_finished(); });
-    std::string client_family = "generic";
-    const auto user_agent = request.headers.find("user-agent");
-    const auto originator = request.headers.find("originator");
-    if ((user_agent != request.headers.end() &&
-         lower(user_agent->second).find("codex") != std::string::npos) ||
-        (originator != request.headers.end() &&
-         lower(originator->second).find("codex") != std::string::npos))
-    {
-        client_family = "codex";
-    }
-    std::string session_hint;
-    for (const char *name : {"session-id", "thread-id"})
-    {
-        const auto found = request.headers.find(name);
-        if (found != request.headers.end() && !found->second.empty() &&
-            found->second.size() <= 1024)
-        {
-            session_hint = found->second;
-            break;
-        }
-    }
-    if (session_hint.empty())
-    {
-        session_hint = adapter->session_hint(payload);
-    }
-
     RouteRequest route_request;
     route_request.request_id = request.request_id;
     route_request.config_version = snapshot->config_version;
@@ -2374,8 +2496,6 @@ void AiGateway::handle_authorized(GatewayRequest request,
     route_request.logical_model = logical_model;
     route_request.scheduling_mode = model->second.scheduling_mode;
     route_request.max_attempts = model->second.max_attempts;
-    route_request.client_family = std::move(client_family);
-    route_request.session_hint = std::move(session_hint);
     route_request.candidates = model->second.candidates;
     std::vector<GovernanceScope> governance_scopes;
     const auto add_scope = [&governance_scopes](const char *kind,
@@ -2405,6 +2525,14 @@ void AiGateway::handle_authorized(GatewayRequest request,
     request_admission.api_key_quota = snapshot->api_key_quota;
 
     auto lease_loss = std::make_shared<LeaseLossSignal>();
+    run_authorized_pipeline(
+        runtime_, routing_, governance_, metrics_, transport_, config,
+        std::move(request), response, cancellation, logical_model, tenant_slug, api_key_id,
+        started, stream, tenant_database_id, api_key_database_id, model_database_id,
+        max_attempts, std::move(governance_scopes), std::move(request_admission),
+        std::move(route_request), std::move(payload), lease_loss, node_lease, node_guard, adapter);
+    return;
+#if 0
     governance_.admit(std::move(governance_scopes),
         [lease_loss] { lease_loss->trigger(); },
         [this, request = std::move(request), &response, cancellation, config,
@@ -2548,7 +2676,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                                 runtime_, routing_, governance_, metrics_, transport_,
                                 std::move(request), response, cancellation, config, *adapter,
                                 std::move(payload),
-                                std::move(plan.candidates), std::move(plan.affinity_key),
+                                std::move(plan.candidates),
                                 logical_model, tenant_slug, api_key_id, tenant_database_id,
                                 api_key_database_id, model_database_id, max_attempts,
                                 std::move(permit), lease_loss, node_lease, node_guard,
@@ -2557,6 +2685,7 @@ void AiGateway::handle_authorized(GatewayRequest request,
                         });
                 });
         });
+#endif
 }
 
 std::string generate_request_id()

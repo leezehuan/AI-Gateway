@@ -135,12 +135,6 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
                 "cached_input_per_million_usd": "0.10",
                 "output_per_million_usd": "4.00", "status": "active",
             }],
-            "health_checks": [{
-                "tenant": "tenant-a", "provider": "provider-a", "name": "models",
-                "endpoint": "responses", "credential": "default", "method": "GET",
-                "url": "http://127.0.0.1:9999/v1/models", "interval_ms": 30000,
-                "timeout_ms": 2000, "status": "active",
-            }],
         }
         path = os.path.join(self.temp.name, "config.json")
         with open(path, "w", encoding="utf-8") as output:
@@ -194,16 +188,12 @@ class GatewayAdminIntegrationTest(unittest.TestCase):
             "2026-08-01\t1000000\t100000\t4000000",
         )
         self.assertEqual(
-            self.query("SELECT method, interval_ms, timeout_ms FROM provider_health_checks"),
-            "GET\t30000\t2000",
-        )
-        self.assertEqual(
             self.query(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='ai_gateway' "
                 "AND table_name IN ('quota_policies','model_prices','usage_records',"
-                "'budget_periods','budget_reservations','provider_health_checks')"
+                "'budget_periods','budget_reservations')"
             ),
-            "6",
+            "5",
         )
         applied_version = int(self.query(
             "SELECT version FROM gateway_config_versions WHERE singleton_id=1"

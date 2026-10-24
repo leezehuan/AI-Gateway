@@ -180,10 +180,10 @@ void validate_status(const std::string &status)
 
 void validate_scheduling_mode(const std::string &mode)
 {
-    if (mode != "fixed_order" && mode != "load_balance" && mode != "cache_affinity")
+    if (mode != "fixed_order" && mode != "load_balance")
     {
         throw std::runtime_error(
-            "routing mode must be fixed_order, load_balance, or cache_affinity");
+            "routing mode must be fixed_order or load_balance");
     }
 }
 
@@ -787,50 +787,6 @@ void apply_config(MySqlConnection &connection, const json &root)
         }
     }
 
-    for (const auto &probe : array_or_empty(root, "health_checks"))
-    {
-        const std::string tenant_slug = required_string(probe, "tenant");
-        const auto tenant_id = require_id(connection,
-            "SELECT id FROM tenants WHERE slug=?", {tenant_slug}, tenant_slug);
-        const auto provider_id = require_id(connection,
-            "SELECT id FROM providers WHERE tenant_id=? AND slug=?",
-            {std::to_string(tenant_id), required_string(probe, "provider")}, "Provider");
-        const auto endpoint_id = require_id(connection,
-            "SELECT id FROM provider_endpoints WHERE provider_id=? AND name=?",
-            {std::to_string(provider_id), required_string(probe, "endpoint")},
-            "Provider Endpoint");
-        const auto credential_id = require_id(connection,
-            "SELECT id FROM provider_credentials WHERE provider_id=? AND name=?",
-            {std::to_string(provider_id), required_string(probe, "credential")},
-            "Provider Credential");
-        const std::string name = required_string(probe, "name");
-        const std::string method = probe.value("method", "GET");
-        const std::string url = required_string(probe, "url");
-        validate_name(name, "Health Check name");
-        validate_url(url);
-        if (method != "GET" && method != "HEAD")
-        {
-            throw std::runtime_error("Health Check method must be GET or HEAD");
-        }
-        const std::string interval = optional_unsigned(probe, "interval_ms").empty()
-                                         ? "30000" : optional_unsigned(probe, "interval_ms");
-        const std::string timeout = optional_unsigned(probe, "timeout_ms").empty()
-                                        ? "2000" : optional_unsigned(probe, "timeout_ms");
-        if (std::stoull(interval) < 1000 || std::stoull(interval) > 3600000 ||
-            std::stoull(timeout) < 100 || std::stoull(timeout) > 60000)
-        {
-            throw std::runtime_error("Health Check interval or timeout is out of range");
-        }
-        upsert(connection,
-            "INSERT INTO provider_health_checks(provider_id, endpoint_id, credential_id, name, "
-            "method, url, interval_ms, timeout_ms, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), endpoint_id=VALUES(endpoint_id), "
-            "credential_id=VALUES(credential_id), method=VALUES(method), url=VALUES(url), "
-            "interval_ms=VALUES(interval_ms), timeout_ms=VALUES(timeout_ms), status=VALUES(status)",
-            {std::to_string(provider_id), std::to_string(endpoint_id),
-             std::to_string(credential_id), name, method, url, interval, timeout,
-             status_of(probe)}, changed);
-    }
 
     if (changed)
     {

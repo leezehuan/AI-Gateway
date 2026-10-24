@@ -97,8 +97,6 @@ public:
     virtual bool renew(const std::string &permit_id,
                        const std::vector<GovernanceScope> &scopes,
                        long lease_ttl_ms) = 0;
-    virtual std::optional<bool> acquire_probe_lease(const std::string &probe_id,
-                                                    long lease_ttl_ms) = 0;
 };
 
 class HiredisGovernanceStore final : public GovernanceStore
@@ -118,8 +116,6 @@ public:
     bool renew(const std::string &permit_id,
                const std::vector<GovernanceScope> &scopes,
                long lease_ttl_ms) override;
-    std::optional<bool> acquire_probe_lease(const std::string &probe_id,
-                                            long lease_ttl_ms) override;
 
 private:
     class Impl;
@@ -131,7 +127,6 @@ class GovernanceRuntime
 public:
     using AdmissionCallback = std::function<void(GovernanceResult)>;
     using CompletionCallback = std::function<void(bool)>;
-    using ProbeLeaseCallback = std::function<void(std::optional<bool>)>;
 
     GovernanceRuntime(GatewayConfig config, GovernanceStore &store);
     ~GovernanceRuntime();
@@ -150,9 +145,6 @@ public:
     void release(std::shared_ptr<const GovernancePermit> permit,
                  CompletionCallback callback = {});
 
-    void acquire_probe_lease(std::string probe_id,
-                             long lease_ttl_ms,
-                             ProbeLeaseCallback callback);
     /* 返回 Redis worker、连接和队列是否允许继续接收治理请求。 */
     bool ready() const;
 

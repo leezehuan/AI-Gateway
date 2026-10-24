@@ -1,7 +1,6 @@
 #include "gateway/routing.hpp"
 
 #include <hiredis/hiredis.h>
-#include <openssl/hmac.h>
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -36,35 +35,7 @@ struct ReplyDeleter
 };
 using Reply = std::unique_ptr<redisReply, ReplyDeleter>;
 
-/* 把二进制摘要编码成稳定的十六进制 Redis key 后缀，不暴露原始会话提示。 */
-std::string hex(const unsigned char *bytes, std::size_t size)
-{
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (std::size_t index = 0; index < size; ++index)
-    {
-        output << std::setw(2) << static_cast<unsigned>(bytes[index]);
-    }
-    return output.str();
-}
-
-std::string affinity_digest(const GatewayConfig &config, const RouteRequest &request)
-{
-    const std::string input = request.public_api_key_id + "\x1f" + request.protocol + "\x1f" +
-        request.logical_model + "\x1f" + request.client_family + "\x1f" +
-        request.session_hint + "\x1f" + std::to_string(request.config_version);
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned digest_size = 0;
-    if (HMAC(EVP_sha256(), config.api_key_hmac_pepper.data(),
-             static_cast<int>(config.api_key_hmac_pepper.size()),
-             reinterpret_cast<const unsigned char *>(input.data()), input.size(), digest,
-             &digest_size) == nullptr || digest_size != SHA256_DIGEST_LENGTH)
-    {
-        throw std::runtime_error("routing affinity digest failed");
-    }
-    return hex(digest, digest_size);
-}
-
+/* 用候选身份计算稳定的 rendezvous hash，不暴露请求或会话内容。 */
 std::uint64_t rendezvous_hash(const std::string &seed, const std::string &candidate)
 {
     const std::string input = seed + "\x1f" + candidate;
@@ -76,19 +47,6 @@ std::uint64_t rendezvous_hash(const std::string &seed, const std::string &candid
         value = (value << 8U) | digest[index];
     }
     return value;
-}
-
-int health_bucket(int score)
-{
-    if (score >= 80)
-    {
-        return 2;
-    }
-    if (score >= 50)
-    {
-        return 1;
-    }
-    return 0;
 }
 
 /* 返回 Redis 熔断时间戳使用的 Unix 毫秒，使用系统时钟以便所有 Gateway 节点共享解释。 */
@@ -161,10 +119,8 @@ public:
 
 
 
-    std::optional<RoutingSnapshot> snapshot(const std::string &affinity_key,
-                                            const std::vector<std::string> &fingerprints,
-                                            std::int64_t current_ms,
-                                            long probe_lease_ms)
+    std::optional<RoutingSnapshot> snapshot(const std::vector<std::string> &fingerprints,
+                                            std::int64_t current_ms)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!ensure_locked())
@@ -173,53 +129,23 @@ public:
         }
 
         RoutingSnapshot result;
-        if (!affinity_key.empty())
-        {
-            Reply affinity(static_cast<redisReply *>(
-                redisCommand(context_, "GET %b", affinity_key.data(), affinity_key.size())));
-            if (!valid_locked(affinity.get()))
-            {
-                disconnect_locked();
-                return std::nullopt;
-            }
-            if (affinity->type == REDIS_REPLY_STRING)
-            {
-                result.affinity_target = std::string(affinity->str, affinity->len);
-            }
-        }
-
         for (const auto &fingerprint : fingerprints)
         {
-            const std::string health_key = key("health", fingerprint);
-            Reply health(static_cast<redisReply *>(redisCommand(
-                context_, "HMGET %b score failures open_until_ms", health_key.data(),
-                health_key.size())));
-            if (!valid_locked(health.get()) || health->type != REDIS_REPLY_ARRAY ||
-                health->elements != 3)
+            const std::string state_key = key("circuit", fingerprint);
+            Reply state_reply(static_cast<redisReply *>(redisCommand(
+                context_, "HMGET %b failures open_until_ms", state_key.data(),
+                state_key.size())));
+            if (!valid_locked(state_reply.get()) || state_reply->type != REDIS_REPLY_ARRAY ||
+                state_reply->elements != 2)
             {
                 disconnect_locked();
                 return std::nullopt;
             }
             CandidateRoutingState state;
-            state.health_score = static_cast<int>(reply_integer(health->element[0], 100));
-            const auto open_until = reply_integer(health->element[2], 0);
+            const auto open_until = reply_integer(state_reply->element[1], 0);
             if (open_until > current_ms)
             {
                 state.circuit_open = true;
-            }
-            else if (open_until > 0)
-            {
-                const std::string probe_key = key("probe", fingerprint);
-                Reply probe(static_cast<redisReply *>(redisCommand(
-                    context_, "SET %b 1 NX PX %ld", probe_key.data(), probe_key.size(),
-                    probe_lease_ms)));
-                if (!valid_locked(probe.get()))
-                {
-                    disconnect_locked();
-                    return std::nullopt;
-                }
-                state.half_open_probe = probe->type == REDIS_REPLY_STATUS;
-                state.circuit_open = !state.half_open_probe;
             }
             result.candidates.emplace(fingerprint, state);
         }
@@ -229,7 +155,6 @@ public:
 
 
     bool record(const std::string &fingerprint,
-                const std::string &affinity_key,
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
@@ -237,29 +162,21 @@ public:
                 unsigned failure_threshold)
     {
         static const std::string script =
-            "local score=tonumber(redis.call('HGET',KEYS[1],'score')) or 100; "
             "local failures=tonumber(redis.call('HGET',KEYS[1],'failures')) or 0; "
             "local open_until=tonumber(redis.call('HGET',KEYS[1],'open_until_ms')) or 0; "
-            "if ARGV[1]=='1' then score=math.min(100,score+5); failures=0; open_until=0; "
-            "elseif ARGV[2]=='1' then score=math.max(0,score-20); failures=failures+1; "
+            "if ARGV[1]=='1' then failures=0; open_until=0; "
+            "elseif ARGV[2]=='1' then failures=failures+1; "
             "if failures>=tonumber(ARGV[3]) then "
             "open_until=tonumber(ARGV[4])+math.max(tonumber(ARGV[5]),tonumber(ARGV[6])); end; end; "
-            "redis.call('HSET',KEYS[1],'score',score,'failures',failures,'open_until_ms',open_until); "
-            "redis.call('PEXPIRE',KEYS[1],ARGV[7]); redis.call('DEL',KEYS[2]); "
-            "if ARGV[1]=='1' and ARGV[8]=='1' then redis.call('SET',KEYS[3],ARGV[10],'PX',ARGV[9]); "
-            "elseif ARGV[1]=='0' and ARGV[8]=='1' and redis.call('GET',KEYS[3])==ARGV[10] "
-            "then redis.call('DEL',KEYS[3]); end; return 1;";
+            "redis.call('HSET',KEYS[1],'failures',failures,'open_until_ms',open_until); "
+            "redis.call('PEXPIRE',KEYS[1],ARGV[7]); return 1;";
 
         std::lock_guard<std::mutex> lock(mutex_);
         if (!ensure_locked())
         {
             return false;
         }
-        const std::string health_key = key("health", fingerprint);
-        const std::string probe_key = key("probe", fingerprint);
-        const std::string safe_affinity = affinity_key.empty()
-                                              ? key("no_affinity", "unused")
-                                              : affinity_key;
+        const std::string state_key = key("circuit", fingerprint);
         const std::string success_value = success ? "1" : "0";
         const std::string retryable_value = retryable_failure ? "1" : "0";
         const std::string threshold = std::to_string(
@@ -267,17 +184,12 @@ public:
         const std::string now = std::to_string(current_ms);
         const std::string cooldown = std::to_string(config_.circuit_open_ms);
         const std::string retry_after = std::to_string(std::min<long>(300000, retry_after_ms));
-        const std::string health_ttl =
-            std::to_string(config_.routing_health_ttl_seconds * 1000);
-        const std::string has_affinity = affinity_key.empty() ? "0" : "1";
-        const std::string affinity_ttl = std::to_string(config_.affinity_ttl_seconds * 1000);
+        const std::string state_ttl = std::to_string(config_.routing_state_ttl_seconds * 1000);
         Reply reply(static_cast<redisReply *>(redisCommand(
-            context_, "EVAL %b 3 %b %b %b %s %s %s %s %s %s %s %s %s %b",
-            script.data(), script.size(), health_key.data(), health_key.size(), probe_key.data(),
-            probe_key.size(), safe_affinity.data(), safe_affinity.size(), success_value.c_str(),
+            context_, "EVAL %b 1 %b %s %s %s %s %s %s %s",
+            script.data(), script.size(), state_key.data(), state_key.size(), success_value.c_str(),
             retryable_value.c_str(), threshold.c_str(), now.c_str(), cooldown.c_str(),
-            retry_after.c_str(), health_ttl.c_str(), has_affinity.c_str(), affinity_ttl.c_str(),
-            fingerprint.data(), fingerprint.size())));
+            retry_after.c_str(), state_ttl.c_str())));
         if (!valid_locked(reply.get()) || reply->type != REDIS_REPLY_INTEGER)
         {
             disconnect_locked();
@@ -387,23 +299,20 @@ HiredisRoutingStore::~HiredisRoutingStore() = default;
 bool HiredisRoutingStore::ping() { return impl_->ping(); }
 
 std::optional<RoutingSnapshot> HiredisRoutingStore::snapshot(
-    const std::string &affinity_key,
     const std::vector<std::string> &candidate_fingerprints,
-    std::int64_t current_ms,
-    long probe_lease_ms)
+    std::int64_t current_ms)
 {
-    return impl_->snapshot(affinity_key, candidate_fingerprints, current_ms, probe_lease_ms);
+    return impl_->snapshot(candidate_fingerprints, current_ms);
 }
 
 bool HiredisRoutingStore::record(const std::string &candidate_fingerprint,
-                                 const std::string &affinity_key,
                                  bool success,
                                  bool retryable_failure,
                                  long retry_after_ms,
                                  std::int64_t current_ms,
                                  unsigned failure_threshold)
 {
-    return impl_->record(candidate_fingerprint, affinity_key, success, retryable_failure,
+    return impl_->record(candidate_fingerprint, success, retryable_failure,
                          retry_after_ms, current_ms, failure_threshold);
 }
 
@@ -444,21 +353,13 @@ public:
                 RoutePlan result;
                 try
                 {
-                    std::string affinity_key;
-                    if (request.scheduling_mode == "cache_affinity" &&
-                        !request.session_hint.empty())
-                    {
-                        affinity_key = config_.redis_key_prefix + ":routing:v1:affinity:" +
-                            affinity_digest(config_, request);
-                    }
                     std::vector<std::string> fingerprints;
                     fingerprints.reserve(request.candidates.size());
                     for (const auto &candidate : request.candidates)
                     {
                         fingerprints.push_back(candidate.fingerprint);
                     }
-                    auto snapshot = store_.snapshot(affinity_key, fingerprints, now_ms(),
-                                                    config_.circuit_probe_lease_ms);
+                    auto snapshot = store_.snapshot(fingerprints, now_ms());
                     if (!snapshot)
                     {
                         ready_.store(false);
@@ -467,7 +368,6 @@ public:
                     else
                     {
                         ready_.store(true);
-                        result.affinity_key = std::move(affinity_key);
                         for (auto &candidate : request.candidates)
                         {
                             const auto state = snapshot->candidates.find(candidate.fingerprint);
@@ -476,37 +376,13 @@ public:
                                 result.candidates.push_back(std::move(candidate));
                             }
                         }
-                        const std::string seed = !result.affinity_key.empty()
-                                                     ? result.affinity_key
-                                                     : request.request_id;
-                        const auto affinity_target = snapshot->affinity_target;
-                        const bool affinity_mode = request.scheduling_mode == "cache_affinity";
-                        const bool load_mode = request.scheduling_mode == "load_balance" ||
-                                               affinity_mode;
+                        const std::string seed = request.request_id;
+                        const bool load_mode = request.scheduling_mode == "load_balance";
                         std::sort(result.candidates.begin(), result.candidates.end(),
                             [&](const ModelTarget &left, const ModelTarget &right) {
-                                if (affinity_mode && affinity_target)
-                                {
-                                    const bool left_match = left.fingerprint == *affinity_target;
-                                    const bool right_match = right.fingerprint == *affinity_target;
-                                    if (left_match != right_match)
-                                    {
-                                        return left_match;
-                                    }
-                                }
                                 if (left.priority != right.priority)
                                 {
                                     return left.priority < right.priority;
-                                }
-                                const int left_score = snapshot->candidates.at(
-                                    left.fingerprint).health_score;
-                                const int right_score = snapshot->candidates.at(
-                                    right.fingerprint).health_score;
-                                const int left_bucket = health_bucket(left_score);
-                                const int right_bucket = health_bucket(right_score);
-                                if (left_bucket != right_bucket)
-                                {
-                                    return left_bucket > right_bucket;
                                 }
                                 if (load_mode)
                                 {
@@ -551,13 +427,12 @@ public:
             }))
         {
             ready_.store(false);
-            (*shared_callback)({RouteStatus::unavailable, {}, {}});
+            (*shared_callback)({RouteStatus::unavailable, {}});
         }
     }
 
     /* 将成功/可重试失败反馈异步写回 Redis；写入失败会使 Gateway routing readiness 变为 false。 */
     void record(std::string fingerprint,
-                std::string affinity_key,
                 bool success,
                 bool retryable_failure,
                 long retry_after_ms,
@@ -565,10 +440,9 @@ public:
                 unsigned failure_threshold = 0)
     {
         auto shared_callback = std::make_shared<FeedbackCallback>(std::move(callback));
-        if (!enqueue([this, fingerprint = std::move(fingerprint),
-                      affinity_key = std::move(affinity_key), success, retryable_failure,
+        if (!enqueue([this, fingerprint = std::move(fingerprint), success, retryable_failure,
                       retry_after_ms, failure_threshold, shared_callback]() mutable {
-                const bool stored = store_.record(fingerprint, affinity_key, success,
+                const bool stored = store_.record(fingerprint, success,
                                                   retryable_failure, retry_after_ms, now_ms(),
                                                   failure_threshold);
                 ready_.store(stored);
@@ -669,24 +543,15 @@ void RoutingRuntime::plan(RouteRequest request, PlanCallback callback)
     impl_->plan(std::move(request), std::move(callback));
 }
 
-/* 对外提交一次普通 Provider 调用的健康/亲和反馈。 */
+/* 对外提交一次普通 Provider 调用的熔断反馈。 */
 void RoutingRuntime::record(std::string candidate_fingerprint,
-                            std::string affinity_key,
                             bool success,
                             bool retryable_failure,
                             long retry_after_ms,
                             FeedbackCallback callback)
 {
-    impl_->record(std::move(candidate_fingerprint), std::move(affinity_key), success,
+    impl_->record(std::move(candidate_fingerprint), success,
                   retryable_failure, retry_after_ms, std::move(callback));
-}
-
-void RoutingRuntime::record_health_probe(std::string candidate_fingerprint,
-                                         bool success,
-                                         FeedbackCallback callback)
-{
-    impl_->record(std::move(candidate_fingerprint), {}, success, !success, 0,
-                  std::move(callback), 3);
 }
 
 /* 返回最近一次 Redis 操作/心跳确认的可用性。 */

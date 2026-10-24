@@ -39,7 +39,6 @@ add_library(ai_gateway_runtime STATIC
     protocol.cpp
     governance.cpp
     metrics.cpp
-    health.cpp
     lifecycle.cpp
 )
 target_include_directories(ai_gateway_runtime PUBLIC

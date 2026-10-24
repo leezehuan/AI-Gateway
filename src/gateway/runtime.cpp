@@ -492,47 +492,6 @@ public:
     }
 
 
-    void load_health_checks(HealthCheckCallback callback)
-    {
-        auto shared_callback = std::make_shared<HealthCheckCallback>(std::move(callback));
-        if (!enqueue([this, shared_callback] {
-                HealthCheckResult result;
-                try
-                {
-                    for (const auto &record : repository_.load_health_checks())
-                    {
-                        HealthCheckTarget target;
-                        target.id = record.id;
-                        target.config_version = record.config_version;
-                        target.credential_id = record.credential_id;
-                        target.provider_slug = record.provider_slug;
-                        target.credential_name = record.credential_name;
-                        target.method = record.method;
-                        target.url = record.url;
-                        target.provider_api_key = resolve_secret(config_, record.secret_ref);
-                        target.interval_ms = record.interval_ms;
-                        target.timeout_ms = record.timeout_ms;
-                        target.credential_quota = record.credential_quota;
-                        for (const auto &mapping : record.mappings)
-                        {
-                            target.candidate_fingerprints.push_back(
-                                candidate_fingerprint(record.config_version, mapping));
-                        }
-                        result.targets.push_back(std::move(target));
-                    }
-                    result.available = true;
-                }
-                catch (...)
-                {
-                    fail_closed();
-                }
-                (*shared_callback)(std::move(result));
-            }))
-        {
-            fail_closed();
-            (*shared_callback)({});
-        }
-    }
 
     /* 幂等更新 Attempt 终态和 Usage 字段，并在失败时 fail closed。 */
     void finish_attempt(AttemptFinish attempt, AuditCallback callback)
@@ -790,11 +749,6 @@ void RuntimeState::admit_request(RequestAdmission request, AdmissionCallback cal
 void RuntimeState::finish_request(RequestFinish request, AuditCallback callback)
 {
     impl_->finish_request(std::move(request), std::move(callback));
-}
-
-void RuntimeState::load_health_checks(HealthCheckCallback callback)
-{
-    impl_->load_health_checks(std::move(callback));
 }
 
 void RuntimeState::finish_attempt(AttemptFinish attempt, AuditCallback callback)

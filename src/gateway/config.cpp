@@ -117,7 +117,7 @@ GatewayConfig GatewayConfig::from_env()
         "AI_GATEWAY_DRAIN_TIMEOUT_MS", 60000, 100, 3600000);
     config.shutdown_cancel_grace_ms = env_number<long>(
         "AI_GATEWAY_SHUTDOWN_CANCEL_GRACE_MS", 5000, 100, 60000);
-    // Redis 保存跨节点 RPM、lease、affinity 和断路器状态。
+    // Redis 保存跨节点 RPM、lease 和断路器状态。
     config.redis_host = env_string("AI_GATEWAY_REDIS_HOST", "127.0.0.1");
     config.redis_port = env_number<std::uint16_t>(
         "AI_GATEWAY_REDIS_PORT", 6379, 1, std::numeric_limits<std::uint16_t>::max());
@@ -132,16 +132,12 @@ GatewayConfig GatewayConfig::from_env()
     config.redis_command_timeout_ms = env_number<long>(
         "AI_GATEWAY_REDIS_COMMAND_TIMEOUT_MS", 500, 10, 30000);
     config.redis_key_prefix = env_string("AI_GATEWAY_REDIS_KEY_PREFIX", "aigw");
-    config.affinity_ttl_seconds = env_number<std::size_t>(
-        "AI_GATEWAY_AFFINITY_TTL_SECONDS", 300, 1, 86400);
-    config.routing_health_ttl_seconds = env_number<std::size_t>(
-        "AI_GATEWAY_ROUTING_HEALTH_TTL_SECONDS", 3600, 30, 604800);
+    config.routing_state_ttl_seconds = env_number<std::size_t>(
+        "AI_GATEWAY_ROUTING_STATE_TTL_SECONDS", 3600, 30, 604800);
     config.circuit_failure_threshold = env_number<unsigned>(
         "AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD", 3, 1, 100);
     config.circuit_open_ms = env_number<long>(
         "AI_GATEWAY_CIRCUIT_OPEN_MS", 30000, 100, 3600000);
-    config.circuit_probe_lease_ms = env_number<long>(
-        "AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS", 10000, 100, 60000);
     config.governance_lease_ttl_ms = env_number<long>(
         "AI_GATEWAY_GOVERNANCE_LEASE_TTL_MS", 120000, 1000, 3600000);
     config.governance_lease_renew_ms = env_number<long>(

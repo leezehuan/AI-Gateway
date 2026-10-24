@@ -66,3 +66,6 @@ core.*
 
 # Locally built standalone JSON example
 /test/testjson/testjson
+
+ops
+ops/*

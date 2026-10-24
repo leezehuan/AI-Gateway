@@ -478,66 +478,6 @@ public:
 
 
 
-    std::vector<RepositoryHealthCheck> load_health_checks()
-    {
-        auto connection = pool_.acquire();
-        verify_schema(*connection);
-        const auto versions = connection->query_prepared(
-            "SELECT version FROM gateway_config_versions WHERE singleton_id=1");
-        if (versions.size() != 1 || versions.front().empty())
-        {
-            throw DatabaseError("Gateway configuration version is unavailable");
-        }
-        const std::uint64_t version = parse_id(versions.front()[0]);
-        std::vector<RepositoryHealthCheck> checks;
-        for (const auto &row : connection->query_prepared(
-                 "SELECT hc.id, p.tenant_id, p.id, pe.id, pc.id, p.slug, pc.name, "
-                 "hc.method, hc.url, hc.interval_ms, hc.timeout_ms, pc.secret_ref, "
-                 "pc.quota_policy_id FROM provider_health_checks hc "
-                 "JOIN providers p ON p.id=hc.provider_id "
-                 "JOIN provider_endpoints pe ON pe.id=hc.endpoint_id AND pe.provider_id=p.id "
-                 "JOIN provider_credentials pc ON pc.id=hc.credential_id AND pc.provider_id=p.id "
-                 "WHERE hc.status='active' AND p.status='active' AND pe.status='active' "
-                 "AND pc.status='active' ORDER BY hc.id"))
-        {
-            RepositoryHealthCheck check;
-            check.id = parse_id(row[0]);
-            check.config_version = version;
-            check.tenant_id = parse_id(row[1]);
-            check.provider_id = parse_id(row[2]);
-            check.endpoint_id = parse_id(row[3]);
-            check.credential_id = parse_id(row[4]);
-            check.provider_slug = row[5];
-            check.credential_name = row[6];
-            check.method = row[7];
-            check.url = row[8];
-            check.interval_ms = static_cast<long>(parse_id(row[9]));
-            check.timeout_ms = static_cast<long>(parse_id(row[10]));
-            check.secret_ref = row[11];
-            check.credential_quota = load_quota(*connection, row[12]);
-            for (const auto &mapping : connection->query_prepared(
-                     "SELECT mm.id, mm.logical_model_id, mm.name, mm.upstream_model "
-                     "FROM model_mappings mm JOIN logical_models lm "
-                     "ON lm.id=mm.logical_model_id WHERE mm.provider_endpoint_id=? "
-                     "AND mm.provider_credential_id=? AND mm.status='active' "
-                     "AND lm.status='active' ORDER BY mm.id",
-                     {std::to_string(check.endpoint_id),
-                      std::to_string(check.credential_id)}))
-            {
-                RepositoryMapping value;
-                value.mapping_id = parse_id(mapping[0]);
-                value.logical_model_id = parse_id(mapping[1]);
-                value.mapping_name = mapping[2];
-                value.provider_id = check.provider_id;
-                value.endpoint_id = check.endpoint_id;
-                value.credential_id = check.credential_id;
-                value.upstream_model = mapping[3];
-                check.mappings.push_back(std::move(value));
-            }
-            checks.push_back(std::move(check));
-        }
-        return checks;
-    }
 
 
 
@@ -733,11 +673,6 @@ RequestAdmissionStatus MySqlGatewayRepository::admit_request(const RequestAdmiss
 void MySqlGatewayRepository::finish_request(const RequestFinish &request)
 {
     impl_->finish_request(request);
-}
-
-std::vector<RepositoryHealthCheck> MySqlGatewayRepository::load_health_checks()
-{
-    return impl_->load_health_checks();
 }
 
 void MySqlGatewayRepository::reconcile_abandoned_requests()

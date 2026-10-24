@@ -17,6 +17,10 @@ using Json = nlohmann::json;
 struct ModelPrice;
 struct ModelTarget;
 
+/* 将协议适配器或流式聚合产生的统一 usage JSON 集中完成计价。 */
+UsageAccounting usage_from_object(const Json &usage,
+                                  const std::vector<ModelPrice> &prices);
+
 struct ProtocolRequestContext
 {
     /* Adapter 从原始 JSON 提取的协议、逻辑模型和 stream 标志。 */
@@ -92,7 +96,6 @@ public:
                                        std::string_view code,
                                        std::string_view message) const = 0;
 
-    virtual std::string session_hint(const Json &payload) const = 0;
 };
 
 /* 按 HTTP method/path 查找内置 Adapter。 */

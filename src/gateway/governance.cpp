@@ -197,27 +197,6 @@ public:
     }
 
 
-    std::optional<bool> acquire_probe_lease(const std::string &probe_id,
-                                            long lease_ttl_ms)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!ensure_locked())
-        {
-            return std::nullopt;
-        }
-        const std::string probe_key = config_.redis_key_prefix +
-                                      ":governance:v1:health_probe:" + probe_id;
-        Reply reply(static_cast<redisReply *>(redisCommand(
-            context_, "SET %b 1 NX PX %ld", probe_key.data(), probe_key.size(),
-            lease_ttl_ms)));
-        if (!valid_locked(reply.get()))
-        {
-            disconnect_locked();
-            return std::nullopt;
-        }
-        return reply->type == REDIS_REPLY_STATUS;
-    }
-
 private:
 
 
@@ -381,12 +360,6 @@ bool HiredisGovernanceStore::renew(
     return impl_->renew(id, scopes, ttl);
 }
 
-std::optional<bool> HiredisGovernanceStore::acquire_probe_lease(
-    const std::string &probe_id, long ttl)
-{
-    return impl_->acquire_probe_lease(probe_id, ttl);
-}
-
 class GovernanceRuntime::Impl
 {
 public:
@@ -464,24 +437,6 @@ public:
     void release(std::shared_ptr<const GovernancePermit> permit, CompletionCallback callback)
     {
         complete(std::move(permit), std::move(callback), true);
-    }
-
-    /* 异步获取健康探测 lease；任何 Redis 不确定结果都会置 not ready。 */
-    void acquire_probe_lease(std::string probe_id,
-                             long lease_ttl_ms,
-                             ProbeLeaseCallback callback)
-    {
-        auto shared_callback = std::make_shared<ProbeLeaseCallback>(std::move(callback));
-        if (!ready_.load() || !enqueue(
-                [this, probe_id = std::move(probe_id), lease_ttl_ms, shared_callback] {
-                    const auto acquired = store_.acquire_probe_lease(probe_id, lease_ttl_ms);
-                    if (!acquired) ready_.store(false);
-                    (*shared_callback)(acquired);
-                }))
-        {
-            ready_.store(false);
-            (*shared_callback)(std::nullopt);
-        }
     }
 
 
@@ -639,13 +594,6 @@ void GovernanceRuntime::release(
     std::shared_ptr<const GovernancePermit> permit, CompletionCallback callback)
 {
     impl_->release(std::move(permit), std::move(callback));
-}
-
-void GovernanceRuntime::acquire_probe_lease(std::string probe_id,
-                                            long lease_ttl_ms,
-                                            ProbeLeaseCallback callback)
-{
-    impl_->acquire_probe_lease(std::move(probe_id), lease_ttl_ms, std::move(callback));
 }
 
 void GovernanceRuntime::rollback(

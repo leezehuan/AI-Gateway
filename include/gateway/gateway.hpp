@@ -106,7 +106,7 @@ struct GatewayConfig
     std::uint16_t listen_port = 8080;
 
     DatabaseConfig database;
-    /* HMAC API Key 和 Redis affinity 摘要共用的高熵 pepper，不可记录。 */
+    /* HMAC API Key 使用的高熵 pepper，不可记录。 */
     std::string api_key_hmac_pepper;
     /* file: Secret 引用允许读取的唯一目录。 */
     std::string secret_dir = "/run/secrets/ai-gateway";
@@ -172,15 +172,13 @@ struct GatewayConfig
     /* 所有 Gateway Redis key 的管理员可配置命名空间前缀。 */
     std::string redis_key_prefix = "aigw";
 
-    std::size_t affinity_ttl_seconds = 300;
-    /* 候选健康分和熔断状态的 Redis TTL。 */
-    std::size_t routing_health_ttl_seconds = 3600;
+    /* 熔断状态的 Redis TTL。 */
+    std::size_t routing_state_ttl_seconds = 3600;
 
     unsigned circuit_failure_threshold = 3;
 
     long circuit_open_ms = 30000;
 
-    long circuit_probe_lease_ms = 10000;
     /* Redis 并发 permit 的 TTL；进程崩溃后由它自动回收。 */
     long governance_lease_ttl_ms = 120000;
     /* 长请求续租频率，必须小于 lease TTL 的一半。 */

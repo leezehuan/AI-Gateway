@@ -48,7 +48,7 @@ struct ModelTarget
     std::string mapping_name;
 
     std::uint16_t priority = 100;
-    /* 不含 URL/Secret/正文的稳定候选摘要，用作 Redis health/affinity key。 */
+    /* 不含 URL/Secret/正文的稳定候选摘要，用于共享熔断状态。 */
     std::string fingerprint;
     /* 由管理员配置的 Provider URL，客户端不能覆盖。 */
     std::string provider_url;
@@ -128,44 +128,6 @@ struct AuthResult
     std::shared_ptr<const AuthSnapshot> snapshot;
 };
 
-/* 显式配置的非计费 Provider 健康探测目标。 */
-struct HealthCheckTarget
-{
-    /* provider_health_checks.id，用于跨节点 probe lease。 */
-    std::uint64_t id = 0;
-
-    std::uint64_t config_version = 0;
-    /* 探测使用的 Credential ID。 */
-    std::uint64_t credential_id = 0;
-    /* 仅用于日志和指标的 Provider 名称。 */
-    std::string provider_slug;
-    /* 仅用于治理和指标的 Credential 名称。 */
-    std::string credential_name;
-
-    std::string method;
-
-    std::string url;
-    /* Secret 引用解析出的内存值。 */
-    std::string provider_api_key;
-
-    long interval_ms = 30000;
-    /* 单次探测总超时。 */
-    long timeout_ms = 2000;
-    /* 探测同样受 Credential RPM/并发约束。 */
-    std::optional<QuotaPolicy> credential_quota;
-    /* 该 Provider/Endpoint/Credential 下需要同步健康状态的候选摘要。 */
-    std::vector<std::string> candidate_fingerprints;
-};
-
-/* 健康探测线程加载配置后的结果；available=false 时不应继续使用旧探测目标。 */
-struct HealthCheckResult
-{
-    /* 数据库和 Secret 解析均成功时为 true；false 时调用方必须丢弃旧目标。 */
-    bool available = false;
-
-    std::vector<HealthCheckTarget> targets;
-};
-
 /*
  * RuntimeState：数据库访问、HMAC 鉴权、Auth Snapshot 缓存和配置版本轮询的异步外观。
  *
@@ -177,7 +139,6 @@ public:
     using AuthCallback = std::function<void(AuthResult)>;
     using AuditCallback = std::function<void(bool)>;
     using AdmissionCallback = std::function<void(RequestAdmissionStatus)>;
-    using HealthCheckCallback = std::function<void(HealthCheckResult)>;
 
     RuntimeState(GatewayConfig config, GatewayRepository &repository);
     ~RuntimeState();
@@ -192,7 +153,6 @@ public:
     /* 异步幂等结算请求级 Usage、预算和租户/API Key lease。 */
     void finish_request(RequestFinish request, AuditCallback callback);
 
-    void load_health_checks(HealthCheckCallback callback);
     /* 在调用 Provider 前写入 started Attempt 审计。 */
     void begin_attempt(AttemptStart attempt, AuditCallback callback);
     /* 写入 Attempt 终态；失败时由 RuntimeState 负责有限重试并 fail closed。 */

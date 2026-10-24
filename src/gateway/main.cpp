@@ -1,7 +1,6 @@
 #include "gateway/curl_transport.hpp"
 #include "gateway/gateway.hpp"
 #include "gateway/governance.hpp"
-#include "gateway/health.hpp"
 #include "gateway/http_server.hpp"
 #include "gateway/lifecycle.hpp"
 #include "gateway/metrics.hpp"
@@ -27,8 +26,6 @@ int main()
         ai_gateway::NodeLifecycle lifecycle(config);
         ai_gateway::MetricsRegistry metrics;
         ai_gateway::CurlMultiProviderTransport transport(config);
-        ai_gateway::HealthProbeRuntime health_probes(
-            runtime, routing, governance, transport, metrics);
         ai_gateway::AiGateway gateway(
             runtime, routing, governance, lifecycle, metrics, transport);
         ai_gateway::structured_log(

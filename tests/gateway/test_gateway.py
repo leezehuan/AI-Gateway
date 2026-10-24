@@ -140,30 +140,6 @@ class MockProviderHandler(BaseHTTPRequestHandler):
                 "text/event-stream",
             )
             return
-        if scenario == "anthropic_success":
-            self.send_json(
-                200,
-                {
-                    "id": "msg_mock",
-                    "type": "message",
-                    "role": "assistant",
-                    "model": "provider-anthropic-model",
-                    "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
-                    "usage": {"input_tokens": 3, "output_tokens": 1},
-                },
-            )
-            return
-        if scenario == "anthropic_stream":
-            self.send_raw(
-                200,
-                b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_mock","type":"message","role":"assistant","content":[],"model":"provider-anthropic-model","usage":{"input_tokens":3,"output_tokens":0}}}\n\n'
-                b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n'
-                b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
-                b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-                "text/event-stream",
-            )
-            return
         if scenario == "slow":
             time.sleep(1.2)
         if scenario == "slow_success":
@@ -210,23 +186,15 @@ class MockProviderHandler(BaseHTTPRequestHandler):
                 ("event: response.created\ndata: " + oversized + "\n\n").encode("utf-8"),
                 "text/event-stream",
             )
-        elif scenario in ("chat_stream_close_after_commit", "anthropic_stream_close_after_commit"):
+        elif scenario == "chat_stream_close_after_commit":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
             self.end_headers()
-            if scenario == "chat_stream_close_after_commit":
-                first = (
-                    b'data: {"id":"chatcmpl_mock","object":"chat.completion.chunk",'
-                    b'"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
-                )
-            else:
-                first = (
-                    b'event: message_start\ndata: {"type":"message_start","message":'
-                    b'{"id":"msg_mock","type":"message","role":"assistant","content":[],'
-                    b'"model":"provider-anthropic-model","usage":{"input_tokens":3,'
-                    b'"output_tokens":0}}}\n\n'
-                )
+            first = (
+                b'data: {"id":"chatcmpl_mock","object":"chat.completion.chunk",'
+                b'"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'
+            )
             self.wfile.write(first)
             self.wfile.flush()
             self.close_connection = True
@@ -841,9 +809,6 @@ class GatewayIntegrationTest(unittest.TestCase):
                      {"name": "chat", "protocol": "chat_completions",
                       "url": f"http://127.0.0.1:{cls.provider_port}/v1/chat/completions",
                       "status": "active"},
-                     {"name": "messages", "protocol": "anthropic_messages",
-                      "url": f"http://127.0.0.1:{cls.provider_port}/v1/messages",
-                      "status": "active"},
                  ],
                  "credentials": [{"name": "default", "secret_ref": "env:TEST_PROVIDER_SECRET_A",
                                   "status": "active"}]},
@@ -866,8 +831,6 @@ class GatewayIntegrationTest(unittest.TestCase):
                  "status": "active"},
                 {"tenant": "tenant-a", "protocol": "chat_completions", "name": "gateway-model",
                  "status": "active"},
-                {"tenant": "tenant-a", "protocol": "anthropic_messages", "name": "gateway-model",
-                 "status": "active"},
                 {"tenant": "tenant-b", "protocol": "responses", "name": "gateway-model",
                  "status": "active"},
                 {"tenant": "tenant-b", "protocol": "responses", "name": "tenant-b-only",
@@ -876,11 +839,10 @@ class GatewayIntegrationTest(unittest.TestCase):
             "policies": [
                 {"tenant": "tenant-a", "slug": "default", "name": "Default A",
                  "status": "active",
-                 "protocols": ["responses", "chat_completions", "anthropic_messages"],
+                 "protocols": ["responses", "chat_completions"],
                  "models": [
                      "gateway-model",
                      {"protocol": "chat_completions", "name": "gateway-model"},
-                     {"protocol": "anthropic_messages", "name": "gateway-model"},
                  ],
                  "providers": ["provider-a", "provider-secondary"]},
                 {"tenant": "tenant-b", "slug": "default", "name": "Default B",
@@ -909,10 +871,6 @@ class GatewayIntegrationTest(unittest.TestCase):
                  "logical_model": "gateway-model", "name": "primary", "provider": "provider-a",
                  "endpoint": "chat", "credential": "default",
                  "upstream_model": "provider-chat-model", "status": "active"},
-                {"tenant": "tenant-a", "protocol": "anthropic_messages",
-                 "logical_model": "gateway-model", "name": "primary", "provider": "provider-a",
-                 "endpoint": "messages", "credential": "default",
-                 "upstream_model": "provider-anthropic-model", "status": "active"},
                 {"tenant": "tenant-b", "protocol": "responses", "logical_model": "gateway-model",
                  "name": "primary", "provider": "provider-b", "endpoint": "responses",
                  "credential": "default", "upstream_model": "provider-model-b", "status": "active"},
@@ -1086,56 +1044,14 @@ class GatewayIntegrationTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(usage, "succeeded\t7\t2\texact")
 
-    def test_anthropic_messages_native_non_streaming_and_provider_auth(self):
-        self.provider_state.reset("anthropic_success")
-        payload = json.dumps({
-            "model": "gateway-model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 32,
-        })
+    def test_anthropic_messages_endpoint_is_removed(self):
         status, _, body = self.request(
-            "POST", "/v1/messages", payload,
+            "POST", "/v1/messages",
+            json.dumps({"model": "gateway-model", "messages": []}),
             {"Authorization": f"Bearer {GATEWAY_KEY}"},
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["model"], "gateway-model")
-        _, calls = self.provider_state.snapshot()
-        self.assertEqual(len(calls), 1)
-        call = calls[0]
-        self.assertEqual(call["path"], "/v1/messages")
-        self.assertEqual(call["payload"]["model"], "provider-anthropic-model")
-        self.assertEqual(call["headers"]["x-api-key"], PROVIDER_KEY)
-        self.assertEqual(call["headers"]["anthropic-version"], "2023-06-01")
-        self.assertNotIn("authorization", call["headers"])
-
-    def test_anthropic_messages_sse_preserves_native_event_sequence(self):
-        self.provider_state.reset("anthropic_stream")
-        payload = json.dumps({
-            "model": "gateway-model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 32,
-            "stream": True,
-        })
-        status, headers, body = self.request(
-            "POST", "/v1/messages", payload,
-            {"Authorization": f"Bearer {GATEWAY_KEY}"},
-        )
-        self.assertEqual(status, 200)
-        self.assertLess(body.find(b"event: message_start"), body.find(b"event: content_block_delta"))
-        self.assertLess(body.find(b"event: content_block_delta"), body.find(b"event: message_delta"))
-        self.assertLess(body.find(b"event: message_delta"), body.find(b"event: message_stop"))
-
-        request_id = next(value for key, value in headers.items() if key.lower() == "x-request-id")
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            usage = self.database_query(
-                "SELECT state, input_tokens, output_tokens, usage_quality FROM usage_records "
-                f"WHERE request_id='{request_id}'"
-            ).strip()
-            if usage.startswith("succeeded"):
-                break
-            time.sleep(0.01)
-        self.assertEqual(usage, "succeeded\t3\t1\texact")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body)["error"]["code"], "not_found")
 
     def test_chat_stream_failure_after_commit_uses_one_native_terminal_error(self):
         self.provider_state.reset("chat_stream_close_after_commit")
@@ -1152,57 +1068,6 @@ class GatewayIntegrationTest(unittest.TestCase):
         self.assertEqual(body.count(b'"code":"upstream_stream_error"'), 1)
         self.assertNotIn(b"[DONE]", body)
         self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
-
-    def test_anthropic_stream_failure_after_commit_uses_one_native_terminal_error(self):
-        self.provider_state.reset("anthropic_stream_close_after_commit")
-        status, _, body = self.request(
-            "POST", "/v1/messages",
-            json.dumps({
-                "model": "gateway-model",
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 32,
-                "stream": True,
-            }),
-            {"Authorization": f"Bearer {GATEWAY_KEY}"},
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(body.count(b"event: error\n"), 1)
-        self.assertEqual(body.count(b'"type":"upstream_stream_error"'), 1)
-        self.assertNotIn(b"event: message_stop", body)
-        self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
-
-    def test_anthropic_validation_and_auth_errors_use_native_error_shape(self):
-        status, _, body = self.request(
-            "POST", "/v1/messages",
-            json.dumps({"model": "gateway-model", "messages": []}),
-            {"Authorization": f"Bearer {GATEWAY_KEY}"},
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(json.loads(body)["type"], "error")
-        self.assertIn("error", json.loads(body))
-
-        status, _, body = self.request(
-            "POST", "/v1/messages",
-            json.dumps({"model": "gateway-model", "messages": [], "max_tokens": 1}),
-        )
-        self.assertEqual(status, 401)
-        self.assertEqual(json.loads(body)["error"]["type"], "invalid_api_key")
-
-    def test_anthropic_accepts_positive_max_tokens_above_signed_range(self):
-        self.provider_state.reset("anthropic_success")
-        status, _, body = self.request(
-            "POST", "/v1/messages",
-            json.dumps({
-                "model": "gateway-model",
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 18446744073709551615,
-            }),
-            {"Authorization": f"Bearer {GATEWAY_KEY}"},
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["type"], "message")
-        _, calls = self.provider_state.snapshot()
-        self.assertEqual(calls[0]["payload"]["max_tokens"], 18446744073709551615)
 
     def start_phase6_gateway(self, **overrides):
         port = free_port()
@@ -1856,88 +1721,6 @@ class GatewayIntegrationTest(unittest.TestCase):
             f"http://127.0.0.1:{self.provider_port}/v1/responses",
         ):
             self.assertNotIn(sensitive, text)
-
-    def test_phase5_two_nodes_share_health_probe_and_exclude_then_restore_candidate(self):
-        secondary = {
-            "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
-            "name": "health-backup", "provider": "provider-secondary",
-            "endpoint": "responses", "credential": "default",
-            "upstream_model": "provider-secondary-model", "priority": 200,
-            "status": "active",
-        }
-        health = {
-            "tenant": "tenant-a", "provider": "provider-a", "name": "non-billable",
-            "endpoint": "responses", "credential": "default", "method": "GET",
-            "url": f"http://127.0.0.1:{self.provider_port}/health",
-            "interval_ms": 1000, "timeout_ms": 200, "status": "active",
-        }
-        try:
-            usage_before = self.database_query("SELECT COUNT(*) FROM usage_records").strip()
-            attempts_before = self.database_query("SELECT COUNT(*) FROM request_attempts").strip()
-            self.provider_state.set_health(500)
-            self.apply_config_patch(
-                {"mappings": [secondary], "health_checks": [health]},
-                "health-probe-enable.json",
-            )
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                _, probes = self.provider_state.health_snapshot()
-                if len(probes) >= 3:
-                    break
-                time.sleep(0.05)
-            self.assertGreaterEqual(len(probes), 3)
-            for previous, current in zip(probes, probes[1:]):
-                self.assertGreater(current - previous, 0.65)
-            self.assertEqual(
-                self.database_query("SELECT COUNT(*) FROM usage_records").strip(), usage_before
-            )
-            self.assertEqual(
-                self.database_query("SELECT COUNT(*) FROM request_attempts").strip(),
-                attempts_before,
-            )
-
-            self.provider_state.reset()
-            self.provider_secondary_state.reset()
-            status, _, body = self.request(
-                "POST", "/v1/responses",
-                json.dumps({"model": "gateway-model", "input": "health excluded"}),
-                {"Authorization": f"Bearer {GATEWAY_KEY}"},
-            )
-            self.assertEqual(status, 200, body)
-            self.assertEqual(len(self.provider_state.snapshot()[1]), 0)
-            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
-
-            self.provider_state.set_health(200)
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                _, recovered = self.provider_state.health_snapshot()
-                if recovered:
-                    break
-                time.sleep(0.05)
-            self.assertTrue(
-                recovered,
-                "primary logs:\n" + "".join(self.logs[-20:])
-                + "\nsecondary logs:\n" + "".join(self.secondary_logs[-20:]),
-            )
-            time.sleep(0.2)
-            self.provider_state.reset()
-            self.provider_secondary_state.reset()
-            status, _, body = self.request_at(
-                self.gateway_secondary_port, "POST", "/v1/responses",
-                json.dumps({"model": "gateway-model", "input": "health restored"}),
-                {"Authorization": f"Bearer {GATEWAY_KEY}"},
-            )
-            self.assertEqual(status, 200, body)
-            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
-            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 0)
-        finally:
-            health["status"] = "disabled"
-            secondary["status"] = "disabled"
-            self.apply_config_patch(
-                {"mappings": [secondary], "health_checks": [health]},
-                "health-probe-disable.json",
-            )
-            time.sleep(0.4)
 
     def test_phase5_coordinator_abandons_expired_usage_and_releases_budget(self):
         key_id = self.public_key_id(BUDGET_KEY)
@@ -3709,10 +3492,10 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.apply_config_patch({"mappings": [secondary]}, "timeout-failover-disable.json")
             time.sleep(0.4)
 
-    def test_phase4_cache_affinity_is_shared_between_gateway_nodes(self):
+    def test_phase4_requests_route_without_session_affinity(self):
         model = {
             "tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
-            "status": "active", "routing": {"mode": "cache_affinity", "max_attempts": 3},
+            "status": "active", "routing": {"mode": "load_balance", "max_attempts": 3},
         }
         secondary = {
             "tenant": "tenant-a", "protocol": "responses", "logical_model": "gateway-model",
@@ -3739,7 +3522,6 @@ class GatewayIntegrationTest(unittest.TestCase):
                 json.dumps({"model": "gateway-model", "input": "affinity first"}), headers,
             )
             self.assertEqual(status, 200, body)
-            first = "primary" if self.provider_state.snapshot()[1] else "secondary"
             self.assertEqual(
                 len(self.provider_state.snapshot()[1]) +
                 len(self.provider_secondary_state.snapshot()[1]),
@@ -3753,8 +3535,11 @@ class GatewayIntegrationTest(unittest.TestCase):
                 json.dumps({"model": "gateway-model", "input": "affinity second"}), headers,
             )
             self.assertEqual(status, 200, body)
-            second = "primary" if self.provider_state.snapshot()[1] else "secondary"
-            self.assertEqual(second, first)
+            self.assertEqual(
+                len(self.provider_state.snapshot()[1]) +
+                len(self.provider_secondary_state.snapshot()[1]),
+                1,
+            )
 
             keys = subprocess.run(
                 ["redis-cli", "-h", "127.0.0.1", "-p", str(self.redis_port), "--scan"],
@@ -3909,7 +3694,7 @@ class GatewayIntegrationTest(unittest.TestCase):
             )
             time.sleep(1.0)
 
-    def test_phase4_circuit_state_and_half_open_probe_are_shared(self):
+    def test_phase4_circuit_cooldown_allows_requests_directly(self):
         model = {
             "tenant": "tenant-a", "protocol": "responses", "name": "gateway-model",
             "status": "active", "routing": {"mode": "fixed_order", "max_attempts": 2},
@@ -3937,7 +3722,6 @@ class GatewayIntegrationTest(unittest.TestCase):
             environment.update({
                 "AI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD": "3",
                 "AI_GATEWAY_CIRCUIT_OPEN_MS": "300",
-                "AI_GATEWAY_CIRCUIT_PROBE_LEASE_MS": "1000",
             })
             circuit_gateway = subprocess.Popen(
                 [self.gateway_binary], env=environment,
@@ -3978,7 +3762,7 @@ class GatewayIntegrationTest(unittest.TestCase):
                 barrier.wait()
                 results.append(self.request_at(
                     port, "POST", "/v1/responses",
-                    json.dumps({"model": "gateway-model", "input": "half-open"}),
+                        json.dumps({"model": "gateway-model", "input": "after-cooldown"}),
                     {"Authorization": f"Bearer {GATEWAY_KEY}"}, timeout=3,
                 ))
 
@@ -3994,8 +3778,8 @@ class GatewayIntegrationTest(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=4)
             self.assertEqual([result[0] for result in results], [200, 200])
-            self.assertEqual(len(self.provider_state.snapshot()[1]), 1)
-            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 1)
+            self.assertEqual(len(self.provider_state.snapshot()[1]), 2)
+            self.assertEqual(len(self.provider_secondary_state.snapshot()[1]), 0)
         finally:
             if circuit_gateway is not None:
                 circuit_gateway.terminate()

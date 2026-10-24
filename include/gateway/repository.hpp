@@ -172,25 +172,6 @@ struct RequestFinish
     UsageAccounting usage;
 };
 
-struct RepositoryHealthCheck
-{
-    std::uint64_t id = 0;
-    std::uint64_t config_version = 0;
-    std::uint64_t tenant_id = 0;
-    std::uint64_t provider_id = 0;
-    std::uint64_t endpoint_id = 0;
-    std::uint64_t credential_id = 0;
-    std::string provider_slug;
-    std::string credential_name;
-    std::string method;
-    std::string url;
-    long interval_ms = 30000;
-    long timeout_ms = 2000;
-    std::string secret_ref;
-    std::optional<QuotaPolicy> credential_quota;
-    std::vector<RepositoryMapping> mappings;
-};
-
 class GatewayRepository
 {
 public:
@@ -206,7 +187,6 @@ public:
     /* 幂等结算 Usage、预算和最终候选。 */
     virtual void finish_request(const RequestFinish &request) = 0;
 
-    virtual std::vector<RepositoryHealthCheck> load_health_checks() = 0;
     /* 协调超时 started Usage 为 abandoned/unknown。 */
     virtual void reconcile_abandoned_requests() = 0;
     /* 写入唯一 Attempt started。 */
@@ -226,7 +206,6 @@ public:
         const std::string &display_prefix) override;
     RequestAdmissionStatus admit_request(const RequestAdmission &request) override;
     void finish_request(const RequestFinish &request) override;
-    std::vector<RepositoryHealthCheck> load_health_checks() override;
     void reconcile_abandoned_requests() override;
     void begin_attempt(const AttemptStart &attempt) override;
     void finish_attempt(const AttemptFinish &attempt) override;
